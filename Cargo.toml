@@ -1,0 +1,7 @@
+[package]
+name = "torch-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tch = "0.24.0"
