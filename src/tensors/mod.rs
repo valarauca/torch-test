@@ -1,0 +1,102 @@
+use std::{
+    path::Path,
+    rc::{Rc},
+    ops::Deref,
+};
+use tch::{Kind};
+use mmap_guard::{FileData,map_file};
+use anamnesis::parse::safetensors::{
+    SafetensorsHeader,parse_safetensors_header,Dtype,
+};
+
+/// Wrapper around safe tensor data
+#[derive(Clone)]
+pub struct SafeTensor {
+    // rc is intentional, once we have multi-gigabyte safe tensor loaded
+    // and we're tealing with cuda drivers we can't have stuff moving between
+    // threads willy-nilly.
+    rc: Rc<InnerSafeTensor>,
+}
+struct InnerSafeTensor {
+    guard: FileData,
+    header: SafetensorsHeader,
+}
+impl SafeTensor {
+
+    /// Load a safe tensor file
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let guard = map_file(path)?;
+        let header = parse_safetensors_header(&guard)?;       
+        let t = InnerSafeTensor { header, guard };
+        Ok(Self { rc: Rc::new(t) })
+    }
+
+    /// returns tensor names
+    pub fn names<'a>(&'a self) -> impl Iterator<Item=&'a str> {
+        self.rc.header.tensors.iter().map(|entry| entry.name.as_str())
+    }
+
+    /// Returns a "wrapped" a tensor.
+    ///
+    /// The type will dereference to a `tch::Tensor`. This is treated as "special" as the tensor
+    /// cannot be resized due to it sharing a memory map of the underlying file.
+    pub fn get_tensor(&self, name: &str, kind: tch::Kind, device: tch::Device) -> anyhow::Result<Option<TensorWrapper>> {
+        let entry = match self.rc.header.tensors.iter().filter(|entry| entry.name.as_str() == name).next() {
+            None => return Ok(None),
+            Some(e) => e,
+        };
+        match (entry.dtype,kind) {
+            (Dtype::BF16,Kind::BFloat16) |
+            (Dtype::F16,Kind::Half) |
+            (Dtype::F32,Kind::Float) |
+            (Dtype::F64,Kind::Double) |
+            (Dtype::Bool,Kind::Bool) |
+            (Dtype::U8,Kind::Uint8) |
+            (Dtype::I8,Kind::Int8) |
+            (Dtype::I16,Kind::Int16) |
+            (Dtype::I32,Kind::Int) |
+            (Dtype::I64,Kind::Int64)|
+            (Dtype::F8E5M2,Kind::Float8e5m2) => { },
+            (input,request) => {
+                anyhow::bail!("cannot tensor '{}' requested '{:?}' file contains '{:?}'", name, request, input);
+            }
+        };
+        // re-allocate shape & strides
+        let shape = entry.shape.iter().map(|&d|d as i64).collect::<Vec<i64>>();
+        let mut strides = vec![1i64; shape.len()];
+        for i in (0..shape.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1] as i64;
+        }
+
+        // slide into our memory map
+        let r = entry.data_offsets.0..entry.data_offsets.1; 
+        let data = &self.rc.deref().guard[r];
+
+        // construct the tensor in torch
+        let tensor = unsafe {
+            tch::Tensor::f_from_blob(
+                data.as_ptr(),
+                &shape,
+                &strides,
+                kind,
+                device,
+            )?
+        };
+        Ok(Some(TensorWrapper {
+            // keep a reference to the memory map around
+            map: self.clone(),
+            tensor,
+        }))
+    }
+}
+
+/// Uses `rc` as once a tensor is loaded (potentially) into GPU memory we shoudln't be passing it
+/// between threads
+pub struct TensorWrapper {
+    map: SafeTensor,
+    tensor: tch::Tensor,
+}
+impl std::ops::Deref for TensorWrapper {
+    type Target = tch::Tensor;
+    fn deref(&self) -> &Self::Target { &self.tensor }
+}

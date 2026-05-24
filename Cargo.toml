@@ -4,4 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anamnesis = "0.6.0"
+anyhow = "1.0.102"
+hf-hub = { version = "0.5.0", features = ["tokio"] }
+image = "0.25.10"
+memmap2 = "0.9.10"
+mmap-guard = "0.2.0"
 tch = "0.24.0"
+tokenizers = "0.23.1"
+tokio = { version = "1.52.3", features = ["full"] }
