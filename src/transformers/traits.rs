@@ -87,6 +87,22 @@ pub trait ImageTokenizer: 'static {
 /// Usually a form of sentence transformer
 pub trait EmbeddingModel: 'static {
     fn embed(&self, info: tch::Tensor) -> anyhow::Result<tch::Tensor>;
+
+    /// Multimodal embedding: encodes text together with optional image patches.
+    ///
+    /// pixel_values: packed patches [total_patches, C * t_patch * h_patch * w_patch]
+    /// grid_thw: (T, H, W) in patch units for each image
+    ///
+    /// Falls back to text-only `embed` when pixel_values is None.
+    fn embed_multimodal(
+        &self,
+        input_ids: tch::Tensor,
+        pixel_values: Option<tch::Tensor>,
+        grid_thw: Option<Vec<(i64, i64, i64)>>,
+    ) -> anyhow::Result<tch::Tensor> {
+        let _ = (pixel_values, grid_thw);
+        self.embed(input_ids)
+    }
 }
 
 /*
