@@ -2815,6 +2815,8 @@ dependencies = [
  "image",
  "memmap2",
  "mmap-guard",
+ "serde",
+ "serde_json",
  "tch",
  "tokenizers",
  "tokio",

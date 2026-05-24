@@ -31,6 +31,27 @@ impl SafeTensor {
         Ok(Self { rc: Rc::new(t) })
     }
 
+    /// Returns the tch `Kind` for a named tensor, or `None` if not present.
+    pub fn kind_of(&self, name: &str) -> Option<tch::Kind> {
+        let dtype = self.rc.header.tensors.iter()
+            .find(|e| e.name.as_str() == name)?
+            .dtype;
+        match dtype {
+            Dtype::BF16   => Some(tch::Kind::BFloat16),
+            Dtype::F16    => Some(tch::Kind::Half),
+            Dtype::F32    => Some(tch::Kind::Float),
+            Dtype::F64    => Some(tch::Kind::Double),
+            Dtype::Bool   => Some(tch::Kind::Bool),
+            Dtype::U8     => Some(tch::Kind::Uint8),
+            Dtype::I8     => Some(tch::Kind::Int8),
+            Dtype::I16    => Some(tch::Kind::Int16),
+            Dtype::I32    => Some(tch::Kind::Int),
+            Dtype::I64    => Some(tch::Kind::Int64),
+            Dtype::F8E5M2 => Some(tch::Kind::Float8e5m2),
+            _             => None,
+        }
+    }
+
     /// returns tensor names
     pub fn names<'a>(&'a self) -> impl Iterator<Item=&'a str> {
         self.rc.header.tensors.iter().map(|entry| entry.name.as_str())

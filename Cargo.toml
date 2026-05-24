@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 anamnesis = "0.6.0"
 anyhow = "1.0.102"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 hf-hub = { version = "0.5.0", features = ["tokio"] }
 image = "0.25.10"
 memmap2 = "0.9.10"
