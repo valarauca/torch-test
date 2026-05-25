@@ -12,7 +12,7 @@ use crate::transformers::{
     model_ids::ModelIds,
     traits::{
         EmbeddingModel, EmbeddingScheme, ImageTokenizer, LocalModelBuilder, ModelFactory,
-        PinnedFuture, RankingModel, TextTokenizer,
+        PinnedFuture, RankingModel, TextTokenizer, TokenizedData,
     },
 };
 use dense::{Attention, DecoderLayer, Linear, Mlp, RotaryEmbedding, RmsNorm, TextConfig, TextModel};
@@ -503,6 +503,20 @@ fn build_mrope_position_ids(
 }
 
 // ---------------------------------------------------------------------------
+// Tokenized data for Qwen3-VL (text-only or multimodal)
+// ---------------------------------------------------------------------------
+
+/// Output of the Qwen3-VL tokenizer. Carries token IDs plus optional vision
+/// tensors so a single `embed` call covers both text-only and multimodal inputs.
+pub struct Qwen3VLTokenizedData {
+    pub input_ids: Tensor,
+    pub pixel_values: Option<Tensor>,
+    pub grid_thw: Option<Vec<(i64, i64, i64)>>,
+}
+
+impl TokenizedData for Qwen3VLTokenizedData {}
+
+// ---------------------------------------------------------------------------
 // Dense embedding / ranking model impls
 // ---------------------------------------------------------------------------
 
@@ -515,35 +529,26 @@ struct EmbeddingModelImpl {
 }
 
 impl EmbeddingModel for EmbeddingModelImpl {
-    fn embed(&self, input_ids: Tensor) -> Result<Tensor> {
-        let hidden = tch::no_grad(|| self.model.forward(&input_ids));
-        let mask = input_ids.ne(self.pad_token_id).to_kind(Kind::Int64);
-        let emb = pool_last(&hidden, &mask);
-        let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1e-12);
-        Ok(emb / norm)
-    }
-
-    fn embed_multimodal(
-        &self,
-        input_ids: Tensor,
-        pixel_values: Option<Tensor>,
-        grid_thw: Option<Vec<(i64, i64, i64)>>,
-    ) -> Result<Tensor> {
-        let vision_out = match (pixel_values, grid_thw.as_deref(), self.vision.as_ref()) {
-            (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(&pv, thw))),
+    fn embed(&self, info: &dyn TokenizedData) -> Result<Tensor> {
+        let data = (info as &dyn std::any::Any)
+            .downcast_ref::<Qwen3VLTokenizedData>()
+            .ok_or_else(|| anyhow::anyhow!("TokenizedData is not Qwen3VLTokenizedData"))?;
+        let input_ids = &data.input_ids;
+        let vision_out = match (data.pixel_values.as_ref(), data.grid_thw.as_deref(), self.vision.as_ref()) {
+            (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(pv, thw))),
             _ => None,
         };
-        let hidden = match (&vision_out, grid_thw.as_deref()) {
+        let hidden = match (&vision_out, data.grid_thw.as_deref()) {
             (Some(vo), Some(thw)) => {
                 let pos_ids = build_mrope_position_ids(
-                    &input_ids,
+                    input_ids,
                     self.image_token_id,
                     thw,
                     self.spatial_merge_size,
                 );
                 tch::no_grad(|| {
                     self.model.forward_multimodal(
-                        &input_ids,
+                        input_ids,
                         &pos_ids,
                         &vo.image_features,
                         &vo.deepstack_features,
@@ -551,7 +556,7 @@ impl EmbeddingModel for EmbeddingModelImpl {
                     )
                 })
             }
-            _ => tch::no_grad(|| self.model.forward(&input_ids)),
+            _ => tch::no_grad(|| self.model.forward(input_ids)),
         };
         let mask = input_ids.ne(self.pad_token_id).to_kind(Kind::Int64);
         let emb = pool_last(&hidden, &mask);
@@ -589,35 +594,26 @@ struct MoeEmbeddingModelImpl {
 }
 
 impl EmbeddingModel for MoeEmbeddingModelImpl {
-    fn embed(&self, input_ids: Tensor) -> Result<Tensor> {
-        let hidden = tch::no_grad(|| self.model.forward(&input_ids));
-        let mask = input_ids.ne(self.pad_token_id).to_kind(Kind::Int64);
-        let emb = pool_last(&hidden, &mask);
-        let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1e-12);
-        Ok(emb / norm)
-    }
-
-    fn embed_multimodal(
-        &self,
-        input_ids: Tensor,
-        pixel_values: Option<Tensor>,
-        grid_thw: Option<Vec<(i64, i64, i64)>>,
-    ) -> Result<Tensor> {
-        let vision_out = match (pixel_values, grid_thw.as_deref(), self.vision.as_ref()) {
-            (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(&pv, thw))),
+    fn embed(&self, info: &dyn TokenizedData) -> Result<Tensor> {
+        let data = (info as &dyn std::any::Any)
+            .downcast_ref::<Qwen3VLTokenizedData>()
+            .ok_or_else(|| anyhow::anyhow!("TokenizedData is not Qwen3VLTokenizedData"))?;
+        let input_ids = &data.input_ids;
+        let vision_out = match (data.pixel_values.as_ref(), data.grid_thw.as_deref(), self.vision.as_ref()) {
+            (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(pv, thw))),
             _ => None,
         };
-        let hidden = match (&vision_out, grid_thw.as_deref()) {
+        let hidden = match (&vision_out, data.grid_thw.as_deref()) {
             (Some(vo), Some(thw)) => {
                 let pos_ids = build_mrope_position_ids(
-                    &input_ids,
+                    input_ids,
                     self.image_token_id,
                     thw,
                     self.spatial_merge_size,
                 );
                 tch::no_grad(|| {
                     self.model.forward_multimodal(
-                        &input_ids,
+                        input_ids,
                         &pos_ids,
                         &vo.image_features,
                         &vo.deepstack_features,
@@ -625,7 +621,7 @@ impl EmbeddingModel for MoeEmbeddingModelImpl {
                     )
                 })
             }
-            _ => tch::no_grad(|| self.model.forward(&input_ids)),
+            _ => tch::no_grad(|| self.model.forward(input_ids)),
         };
         let mask = input_ids.ne(self.pad_token_id).to_kind(Kind::Int64);
         let emb = pool_last(&hidden, &mask);
