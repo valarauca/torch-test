@@ -2,6 +2,9 @@ pub mod dense;
 pub mod moe;
 pub mod vision;
 
+#[cfg(test)]
+mod tests_qwen3_dense;
+
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
@@ -209,7 +212,7 @@ fn parse_dense_config(
 
     let num_attention_heads = tc["num_attention_heads"].as_i64().context("num_attention_heads")?;
 
-    let mrope_section = tc["rope_parameters"]["mrope_section"]
+    let mrope_section = tc["rope_scaling"]["mrope_section"]
         .as_array()
         .and_then(|a| {
             if a.len() == 3 {
@@ -218,7 +221,7 @@ fn parse_dense_config(
                 None
             }
         })
-        .context("rope_parameters.mrope_section missing or malformed in config.json")?;
+        .context("rope_scaling.mrope_section missing or malformed in config.json")?;
 
     let text_cfg = TextConfig {
         hidden_size: tc["hidden_size"].as_i64().context("hidden_size")?,
@@ -228,7 +231,7 @@ fn parse_dense_config(
         num_key_value_heads: tc["num_key_value_heads"].as_i64().unwrap_or(num_attention_heads),
         head_dim: tc["head_dim"].as_i64().context("head_dim")?,
         rms_norm_eps: tc["rms_norm_eps"].as_f64().context("rms_norm_eps")?,
-        rope_theta: tc["rope_parameters"]["rope_theta"].as_f64().unwrap_or(500_000.0),
+        rope_theta: tc["rope_theta"].as_f64().unwrap_or(500_000.0),
         mrope_section,
     };
 
@@ -313,7 +316,7 @@ fn parse_moe_config(
 
     let hidden_size = tc["hidden_size"].as_i64().context("hidden_size")?;
 
-    let mrope_section = tc["rope_parameters"]["mrope_section"]
+    let mrope_section = tc["rope_scaling"]["mrope_section"]
         .as_array()
         .and_then(|a| {
             if a.len() == 3 {
@@ -322,7 +325,7 @@ fn parse_moe_config(
                 None
             }
         })
-        .context("rope_parameters.mrope_section missing or malformed in config.json")?;
+        .context("rope_scaling.mrope_section missing or malformed in config.json")?;
 
     let text_cfg = MoeTextConfig {
         hidden_size,
@@ -332,7 +335,7 @@ fn parse_moe_config(
         num_key_value_heads: tc["num_key_value_heads"].as_i64().unwrap_or(num_attention_heads),
         head_dim: tc["head_dim"].as_i64().context("head_dim")?,
         rms_norm_eps: tc["rms_norm_eps"].as_f64().context("rms_norm_eps")?,
-        rope_theta: tc["rope_parameters"]["rope_theta"].as_f64().unwrap_or(500_000.0),
+        rope_theta: tc["rope_theta"].as_f64().unwrap_or(500_000.0),
         mrope_section,
         decoder_sparse_step: tc["decoder_sparse_step"].as_u64().unwrap_or(1) as usize,
         moe_intermediate_size: tc["moe_intermediate_size"]
@@ -833,4 +836,18 @@ impl ModelFactory for Qwen3VLMoeFactory {
     fn load(repo: Box<dyn crate::transformers::traits::ModelRepo>, device: tch::Device) -> PinnedFuture<Box<dyn LocalModelBuilder>> {
         Box::pin(load_moe_builder(repo, device))
     }
+}
+
+#[cfg(test)]
+/// Loads the dense `TextModel` from a local directory for use in tests.
+pub(crate) fn load_text_model_from_dir(p: &std::path::Path) -> Result<dense::TextModel> {
+    struct Dir(std::path::PathBuf);
+    impl crate::transformers::traits::ModelRepo for Dir {
+        fn identifier(&self) -> Option<crate::transformers::model_ids::ModelIds> { None }
+        fn get_local_path(&self, n: &str) -> Result<Option<std::path::PathBuf>> {
+            Ok(Some(self.0.join(n)))
+        }
+    }
+    let (cfg, _, _) = parse_dense_config(&Dir(p.to_owned()))?;
+    build_dense_text_model(&WeightMap::load(&Dir(p.to_owned()), tch::Device::Cpu)?, &cfg)
 }

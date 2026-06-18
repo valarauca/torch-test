@@ -123,8 +123,9 @@ pub fn apply_rotary_pos_emb(
     cos: &Tensor,
     sin: &Tensor,
 ) -> (Tensor, Tensor) {
-    let cos = cos.unsqueeze(1);
-    let sin = sin.unsqueeze(1);
+    let kind = q.kind();
+    let cos = cos.unsqueeze(1).to_kind(kind);
+    let sin = sin.unsqueeze(1).to_kind(kind);
     (q * &cos + rotate_half(q) * &sin, k * &cos + rotate_half(k) * &sin)
 }
 

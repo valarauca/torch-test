@@ -89,8 +89,9 @@ impl SafeTensor {
             strides[i] = strides[i + 1] * shape[i + 1] as i64;
         }
 
-        // slide into our memory map
-        let r = entry.data_offsets.0..entry.data_offsets.1; 
+        // data_offsets are relative to the data section which begins at header_size + 8
+        let base = self.rc.header.header_size + 8;
+        let r = (base + entry.data_offsets.0)..(base + entry.data_offsets.1);
         let data = &self.rc.deref().guard[r];
 
         // construct the tensor in torch
