@@ -94,6 +94,13 @@ impl SafeTensor {
         let data = &self.rc.deref().guard[r];
 
         // construct the tensor in torch
+        // SAFETY: three invariants hold here.
+        // 1. Pointer lifetime: TensorWrapper retains a SafeTensor clone (Rc<InnerSafeTensor>),
+        //    keeping the FileData mmap alive for the full lifetime of the tensor.
+        // 2. No mutation: FileData::Mapped wraps memmap2::Mmap (PROT_READ only), so any
+        //    in-place PyTorch op through Deref will SIGSEGV rather than silently corrupt the map.
+        // 3. Alignment: safetensors pads every tensor's data region to 8-byte boundaries,
+        //    covering all dtypes matched above (max alignment requirement: 8 bytes for F64/I64).
         let tensor = unsafe {
             tch::Tensor::f_from_blob(
                 data.as_ptr(),

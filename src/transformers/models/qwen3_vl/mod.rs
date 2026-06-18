@@ -218,7 +218,7 @@ fn parse_dense_config(
                 None
             }
         })
-        .unwrap_or([24, 20, 20]);
+        .context("rope_parameters.mrope_section missing or malformed in config.json")?;
 
     let text_cfg = TextConfig {
         hidden_size: tc["hidden_size"].as_i64().context("hidden_size")?,
@@ -233,7 +233,7 @@ fn parse_dense_config(
     };
 
     let vision_cfg = parse_vision_config(vc, text_cfg.hidden_size)?;
-    let image_token_id = raw["image_token_id"].as_i64().unwrap_or(151655);
+    let image_token_id = raw["image_token_id"].as_i64().context("image_token_id missing from config.json")?;
 
     Ok((text_cfg, vision_cfg, image_token_id))
 }
@@ -322,7 +322,7 @@ fn parse_moe_config(
                 None
             }
         })
-        .unwrap_or([24, 20, 20]);
+        .context("rope_parameters.mrope_section missing or malformed in config.json")?;
 
     let text_cfg = MoeTextConfig {
         hidden_size,
@@ -346,7 +346,7 @@ fn parse_moe_config(
     };
 
     let vision_cfg = parse_vision_config(vc, hidden_size)?;
-    let image_token_id = raw["image_token_id"].as_i64().unwrap_or(151655);
+    let image_token_id = raw["image_token_id"].as_i64().context("image_token_id missing from config.json")?;
 
     Ok((text_cfg, vision_cfg, image_token_id))
 }
@@ -517,6 +517,58 @@ pub struct Qwen3VLTokenizedData {
 impl TokenizedData for Qwen3VLTokenizedData {}
 
 // ---------------------------------------------------------------------------
+// Shared text-forward trait (bridges TextModel and MoeTextModel)
+// ---------------------------------------------------------------------------
+
+trait TextForward {
+    fn fwd(&self, input_ids: &Tensor) -> Tensor;
+    fn fwd_mm(&self, input_ids: &Tensor, pos: &Tensor, img: &Tensor, ds: &[Tensor], tok: i64) -> Tensor;
+}
+
+impl TextForward for TextModel {
+    fn fwd(&self, input_ids: &Tensor) -> Tensor { self.forward(input_ids) }
+    fn fwd_mm(&self, input_ids: &Tensor, pos: &Tensor, img: &Tensor, ds: &[Tensor], tok: i64) -> Tensor {
+        self.forward_multimodal(input_ids, pos, img, ds, tok)
+    }
+}
+
+impl TextForward for MoeTextModel {
+    fn fwd(&self, input_ids: &Tensor) -> Tensor { self.forward(input_ids) }
+    fn fwd_mm(&self, input_ids: &Tensor, pos: &Tensor, img: &Tensor, ds: &[Tensor], tok: i64) -> Tensor {
+        self.forward_multimodal(input_ids, pos, img, ds, tok)
+    }
+}
+
+fn embed_inner(
+    model: &dyn TextForward,
+    vision: Option<&Arc<VisionModel>>,
+    pad_token_id: i64,
+    image_token_id: i64,
+    spatial_merge_size: i64,
+    info: &dyn TokenizedData,
+) -> Result<Tensor> {
+    let data = (info as &dyn std::any::Any)
+        .downcast_ref::<Qwen3VLTokenizedData>()
+        .ok_or_else(|| anyhow::anyhow!("TokenizedData is not Qwen3VLTokenizedData"))?;
+    let input_ids = &data.input_ids;
+    let vision_out = match (data.pixel_values.as_ref(), data.grid_thw.as_deref(), vision) {
+        (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(pv, thw))),
+        _ => None,
+    };
+    let hidden = match (&vision_out, data.grid_thw.as_deref()) {
+        (Some(vo), Some(thw)) => {
+            let pos_ids = build_mrope_position_ids(input_ids, image_token_id, thw, spatial_merge_size);
+            tch::no_grad(|| model.fwd_mm(input_ids, &pos_ids, &vo.image_features, &vo.deepstack_features, image_token_id))
+        }
+        _ => tch::no_grad(|| model.fwd(input_ids)),
+    };
+    let mask = input_ids.ne(pad_token_id).to_kind(Kind::Int64);
+    let emb = pool_last(&hidden, &mask);
+    let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1e-12);
+    Ok(emb / norm)
+}
+
+// ---------------------------------------------------------------------------
 // Dense embedding / ranking model impls
 // ---------------------------------------------------------------------------
 
@@ -530,38 +582,7 @@ struct EmbeddingModelImpl {
 
 impl EmbeddingModel for EmbeddingModelImpl {
     fn embed(&self, info: &dyn TokenizedData) -> Result<Tensor> {
-        let data = (info as &dyn std::any::Any)
-            .downcast_ref::<Qwen3VLTokenizedData>()
-            .ok_or_else(|| anyhow::anyhow!("TokenizedData is not Qwen3VLTokenizedData"))?;
-        let input_ids = &data.input_ids;
-        let vision_out = match (data.pixel_values.as_ref(), data.grid_thw.as_deref(), self.vision.as_ref()) {
-            (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(pv, thw))),
-            _ => None,
-        };
-        let hidden = match (&vision_out, data.grid_thw.as_deref()) {
-            (Some(vo), Some(thw)) => {
-                let pos_ids = build_mrope_position_ids(
-                    input_ids,
-                    self.image_token_id,
-                    thw,
-                    self.spatial_merge_size,
-                );
-                tch::no_grad(|| {
-                    self.model.forward_multimodal(
-                        input_ids,
-                        &pos_ids,
-                        &vo.image_features,
-                        &vo.deepstack_features,
-                        self.image_token_id,
-                    )
-                })
-            }
-            _ => tch::no_grad(|| self.model.forward(input_ids)),
-        };
-        let mask = input_ids.ne(self.pad_token_id).to_kind(Kind::Int64);
-        let emb = pool_last(&hidden, &mask);
-        let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1e-12);
-        Ok(emb / norm)
+        embed_inner(&*self.model, self.vision.as_ref(), self.pad_token_id, self.image_token_id, self.spatial_merge_size, info)
     }
 }
 
@@ -581,10 +602,6 @@ impl RankingModel for RankingModelImpl {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MoE embedding model impl
-// ---------------------------------------------------------------------------
-
 struct MoeEmbeddingModelImpl {
     model: Arc<MoeTextModel>,
     vision: Option<Arc<VisionModel>>,
@@ -595,38 +612,7 @@ struct MoeEmbeddingModelImpl {
 
 impl EmbeddingModel for MoeEmbeddingModelImpl {
     fn embed(&self, info: &dyn TokenizedData) -> Result<Tensor> {
-        let data = (info as &dyn std::any::Any)
-            .downcast_ref::<Qwen3VLTokenizedData>()
-            .ok_or_else(|| anyhow::anyhow!("TokenizedData is not Qwen3VLTokenizedData"))?;
-        let input_ids = &data.input_ids;
-        let vision_out = match (data.pixel_values.as_ref(), data.grid_thw.as_deref(), self.vision.as_ref()) {
-            (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(pv, thw))),
-            _ => None,
-        };
-        let hidden = match (&vision_out, data.grid_thw.as_deref()) {
-            (Some(vo), Some(thw)) => {
-                let pos_ids = build_mrope_position_ids(
-                    input_ids,
-                    self.image_token_id,
-                    thw,
-                    self.spatial_merge_size,
-                );
-                tch::no_grad(|| {
-                    self.model.forward_multimodal(
-                        input_ids,
-                        &pos_ids,
-                        &vo.image_features,
-                        &vo.deepstack_features,
-                        self.image_token_id,
-                    )
-                })
-            }
-            _ => tch::no_grad(|| self.model.forward(input_ids)),
-        };
-        let mask = input_ids.ne(self.pad_token_id).to_kind(Kind::Int64);
-        let emb = pool_last(&hidden, &mask);
-        let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1e-12);
-        Ok(emb / norm)
+        embed_inner(&*self.model, self.vision.as_ref(), self.pad_token_id, self.image_token_id, self.spatial_merge_size, info)
     }
 }
 
@@ -758,7 +744,7 @@ async fn load_dense_builder(
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?;
 
-    let pad_token_id = tokenizer.token_to_id("<|endoftext|>").unwrap_or(0) as i64;
+    let pad_token_id = tokenizer.token_to_id("<|endoftext|>").context("'<|endoftext|>' not in tokenizer vocab")? as i64;
 
     let score_weight = if matches!(id, ModelIds::Qwen3VLReranker) {
         Some(build_score_weight(&ws, &tokenizer)?)
@@ -767,7 +753,7 @@ async fn load_dense_builder(
     };
 
     let model = Arc::new(build_dense_text_model(&ws, &text_cfg)?);
-    let vision = build_vision_model(&ws, &vision_cfg).ok().map(Arc::new);
+    let vision = Some(Arc::new(build_vision_model(&ws, &vision_cfg)?));
 
     Ok(Box::new(Qwen3VLBuilder {
         id,
@@ -792,11 +778,10 @@ async fn load_moe_builder(
         .context("tokenizer.json not found")?;
     let pad_token_id = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?
-        .token_to_id("<|endoftext|>")
-        .unwrap_or(0) as i64;
+        .token_to_id("<|endoftext|>").context("'<|endoftext|>' not in tokenizer vocab")? as i64;
 
     let model = Arc::new(build_moe_text_model(&ws, &text_cfg)?);
-    let vision = build_vision_model(&ws, &vision_cfg).ok().map(Arc::new);
+    let vision = Some(Arc::new(build_vision_model(&ws, &vision_cfg)?));
 
     Ok(Box::new(Qwen3VLMoeBuilder {
         model,
