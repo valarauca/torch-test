@@ -4,7 +4,7 @@ use tokenizers::Tokenizer;
 use tch::{Kind, Tensor, no_grad};
 use pyo3::{ffi::c_str, types::{PyAnyMethods, PyDict, PyDictMethods}, PyResult, Python};
 use crate::transformers::repo::init_repo;
-use crate::transformers::traits::{EmbeddingScheme, ModelFactory, ModelLoader};
+use crate::transformers::traits::{EmbeddingScheme, ModelFactory};
 use super::{Qwen3VLEmbeddingFactory, Qwen3VLTokenizedData};
 
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn qwen3_dense_forward_matches_python() {
     assert_eq!(rust_vec.len(), py_vec.len(), "hidden size mismatch");
     let mismatches: Vec<usize> = rust_vec.iter().zip(&py_vec)
         .enumerate()
-        .filter(|(_, (a, b))| (*a - *b).abs() > 1e-2)
+        .filter(|(_, (a, b))| (*a - *b).abs() > 1e-6)
         .map(|(i, _)| i)
         .collect();
     assert!(
@@ -91,7 +91,7 @@ async fn qwen3_dense_embed_matches_python() {
     assert_eq!(rust_vec.len(), py_vec.len(), "embedding size mismatch");
     let mismatches: Vec<usize> = rust_vec.iter().zip(&py_vec)
         .enumerate()
-        .filter(|(_, (a, b))| (*a - *b).abs() > 1e-2)
+        .filter(|(_, (a, b))| (*a - *b).abs() > 1e-6)
         .map(|(i, _)| i)
         .collect();
     assert!(mismatches.is_empty(), "{} mismatches; first at [{}]: rust={:.6} py={:.6}",
