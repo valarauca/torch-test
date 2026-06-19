@@ -19,20 +19,29 @@ pub trait ModelRepo: 'static + Sync + Send {
     /// Returns the path of this item within a repo.
     ///
     /// Function is `async` as to permit downloading behind the scenes if the model is remote
-    fn get_local_path(&self, _name: &str) -> anyhow::Result<Option<PathBuf>>;
+    fn get_local_path<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output=anyhow::Result<Option<PathBuf>>> + 'a>>;
 }
 
 /// ModelFactory constructs the underly model
-pub trait ModelFactory: 'static + Sync {
+pub trait ModelFactory: 'static + Sync + Send {
 
     /// What model are we working with
     fn identifier(&self) -> Option<ModelIds>;
 
     /// Load a model.
-    fn load(repo: Box<dyn ModelRepo>, _device: tch::Device) -> PinnedFuture<Box<dyn LocalModelBuilder>>;
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=anyhow::Result<Box<dyn ModelLoader>>> + 'a>>;
 }
 
-/// Represents a model is "ready to run". 
+/// Handles loading a model's tensors into memory
+pub trait ModelLoader: 'static + Send {
+    /// Returns the model variant this loader was constructed for.
+    fn identifier(&self) -> Option<ModelIds>;
+    /// Allocates tensors onto `device` and returns a ready to run model.
+    fn initialize(&self, _device: tch::Device) -> anyhow::Result<Box<dyn LocalModelBuilder>>;
+}
+
+/// Represents a model is "ready to run".
+/// When this type is dropped all tensors should be unloaded.
 pub trait LocalModelBuilder: 'static {
 
     fn identifier(&self) -> Option<ModelIds>;
@@ -69,6 +78,8 @@ pub enum EmbeddingScheme {
 
 pub trait TextTokenizer: 'static {
     fn encode(&self, text: &str) -> anyhow::Result<Box<dyn TokenizedData>>;
+
+    /// TODO: eventually this'll require a classifier.
     fn decode(&self, tokens: tch::Tensor) -> anyhow::Result<String>;
 }
 

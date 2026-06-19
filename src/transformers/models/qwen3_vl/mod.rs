@@ -5,7 +5,7 @@ pub mod vision;
 #[cfg(test)]
 mod tests_qwen3_dense;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::{Context, Result};
 use tch::{Kind, Tensor};
@@ -15,9 +15,11 @@ use crate::transformers::{
     model_ids::ModelIds,
     traits::{
         EmbeddingModel, EmbeddingScheme, ImageTokenizer, LocalModelBuilder, ModelFactory,
-        PinnedFuture, RankingModel, TextTokenizer, TokenizedData,
+        ModelLoader, ModelRepo, RankingModel, TextTokenizer, TokenizedData,
     },
 };
+#[cfg(test)]
+use crate::transformers::repo::init_repo;
 use dense::{Attention, DecoderLayer, Linear, Mlp, RotaryEmbedding, RmsNorm, TextConfig, TextModel};
 use moe::{
     Experts, LayerMlp, MoeDecoderLayer, MoeTextConfig, MoeTextModel, SparseMoeBlock, TopKRouter,
@@ -40,14 +42,14 @@ struct WeightMap {
 impl WeightMap {
     /// Loads either a single `model.safetensors` or all shards listed in
     /// `model.safetensors.index.json`.
-    fn load(repo: &dyn crate::transformers::traits::ModelRepo, device: tch::Device) -> Result<Self> {
+    async fn load(repo: &dyn ModelRepo, device: tch::Device) -> Result<Self> {
         let mut shards = Vec::new();
 
-        if let Some(path) = repo.get_local_path("model.safetensors")? {
+        if let Some(path) = repo.get_local_path("model.safetensors").await? {
             shards.push(SafeTensor::load(&path)?);
         } else {
             let idx_path = repo
-                .get_local_path("model.safetensors.index.json")?
+                .get_local_path("model.safetensors.index.json").await?
                 .context("neither model.safetensors nor model.safetensors.index.json found")?;
 
             let idx_str = std::fs::read_to_string(&idx_path)?;
@@ -59,12 +61,17 @@ impl WeightMap {
                 .collect();
 
             for shard_name in shard_names {
-                let path = repo.get_local_path(shard_name)?
+                let path = repo.get_local_path(shard_name).await?
                     .with_context(|| format!("shard not found: {shard_name}"))?;
                 shards.push(SafeTensor::load(&path)?);
             }
         }
 
+        Ok(Self { shards, device })
+    }
+
+    fn from_paths(paths: Vec<PathBuf>, device: tch::Device) -> Result<Self> {
+        let shards = paths.iter().map(|p| SafeTensor::load(p)).collect::<Result<_>>()?;
         Ok(Self { shards, device })
     }
 
@@ -82,6 +89,28 @@ impl WeightMap {
         }
         anyhow::bail!("weight not found: {name}")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shard path resolver — async half of weight loading
+// ---------------------------------------------------------------------------
+
+async fn resolve_shard_paths(repo: &dyn ModelRepo) -> Result<Vec<PathBuf>> {
+    if let Some(path) = repo.get_local_path("model.safetensors").await? {
+        return Ok(vec![path]);
+    }
+    let idx_path = repo.get_local_path("model.safetensors.index.json").await?
+        .context("neither model.safetensors nor model.safetensors.index.json found")?;
+    let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(idx_path)?)?;
+    let shard_names: HashSet<&str> = idx["weight_map"].as_object()
+        .context("invalid index: missing weight_map")?
+        .values().filter_map(|v| v.as_str()).collect();
+    let mut paths = Vec::new();
+    for name in shard_names {
+        paths.push(repo.get_local_path(name).await?
+            .with_context(|| format!("shard not found: {name}"))?);
+    }
+    Ok(paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,11 +229,11 @@ fn pool_last(hidden: &Tensor, attention_mask: &Tensor) -> Tensor {
 // Dense: config, text model, score weight
 // ---------------------------------------------------------------------------
 
-fn parse_dense_config(
-    repo: &dyn crate::transformers::traits::ModelRepo,
+async fn parse_dense_config(
+    repo: &dyn ModelRepo,
 ) -> Result<(TextConfig, VisionConfig, i64)> {
     let path = repo
-        .get_local_path("config.json")?
+        .get_local_path("config.json").await?
         .context("config.json not found")?;
     let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     let tc = &raw["text_config"];
@@ -290,11 +319,11 @@ fn build_score_weight(ws: &WeightMap, tokenizer: &tokenizers::Tokenizer) -> Resu
 // MoE: config, text model
 // ---------------------------------------------------------------------------
 
-fn parse_moe_config(
-    repo: &dyn crate::transformers::traits::ModelRepo,
+async fn parse_moe_config(
+    repo: &dyn ModelRepo,
 ) -> Result<(MoeTextConfig, VisionConfig, i64)> {
     let path = repo
-        .get_local_path("config.json")?
+        .get_local_path("config.json").await?
         .context("config.json not found")?;
     let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     let tc = &raw["text_config"];
@@ -620,6 +649,60 @@ impl EmbeddingModel for MoeEmbeddingModelImpl {
 }
 
 // ---------------------------------------------------------------------------
+// ModelLoader implementations
+// ---------------------------------------------------------------------------
+
+struct Qwen3VLDenseModelLoader {
+    id: ModelIds,
+    text_cfg: TextConfig,
+    vision_cfg: VisionConfig,
+    image_token_id: i64,
+    tokenizer: tokenizers::Tokenizer,
+    shard_paths: Vec<PathBuf>,
+}
+
+impl ModelLoader for Qwen3VLDenseModelLoader {
+    fn identifier(&self) -> Option<ModelIds> { Some(self.id) }
+    fn initialize(&self, device: tch::Device) -> Result<Box<dyn LocalModelBuilder>> {
+        let ws = WeightMap::from_paths(self.shard_paths.clone(), device)?;
+        let pad = self.tokenizer.token_to_id("<|endoftext|>").context("pad token missing")? as i64;
+        let sw = matches!(self.id, ModelIds::Qwen3VLReranker)
+            .then(|| build_score_weight(&ws, &self.tokenizer)).transpose()?;
+        Ok(Box::new(Qwen3VLBuilder {
+            id: self.id,
+            model: Arc::new(build_dense_text_model(&ws, &self.text_cfg)?),
+            vision: Some(Arc::new(build_vision_model(&ws, &self.vision_cfg)?)),
+            score_weight: sw, pad_token_id: pad,
+            image_token_id: self.image_token_id,
+            spatial_merge_size: self.vision_cfg.spatial_merge_size,
+        }))
+    }
+}
+
+struct Qwen3VLMoeModelLoader {
+    text_cfg: MoeTextConfig,
+    vision_cfg: VisionConfig,
+    image_token_id: i64,
+    tokenizer: tokenizers::Tokenizer,
+    shard_paths: Vec<PathBuf>,
+}
+
+impl ModelLoader for Qwen3VLMoeModelLoader {
+    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLMoe) }
+    fn initialize(&self, device: tch::Device) -> Result<Box<dyn LocalModelBuilder>> {
+        let ws = WeightMap::from_paths(self.shard_paths.clone(), device)?;
+        let pad = self.tokenizer.token_to_id("<|endoftext|>").context("pad token missing")? as i64;
+        Ok(Box::new(Qwen3VLMoeBuilder {
+            model: Arc::new(build_moe_text_model(&ws, &self.text_cfg)?),
+            vision: Some(Arc::new(build_vision_model(&ws, &self.vision_cfg)?)),
+            pad_token_id: pad,
+            image_token_id: self.image_token_id,
+            spatial_merge_size: self.vision_cfg.spatial_merge_size,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dense builder
 // ---------------------------------------------------------------------------
 
@@ -734,65 +817,28 @@ impl LocalModelBuilder for Qwen3VLMoeBuilder {
 // ---------------------------------------------------------------------------
 
 async fn load_dense_builder(
-    repo: Box<dyn crate::transformers::traits::ModelRepo>,
-    device: tch::Device,
+    repo: Box<dyn ModelRepo>,
     id: ModelIds,
-) -> Result<Box<dyn LocalModelBuilder>> {
-    let (text_cfg, vision_cfg, image_token_id) = parse_dense_config(repo.as_ref())?;
-    let ws = WeightMap::load(repo.as_ref(), device)?;
-
-    let tokenizer_path: PathBuf = repo
-        .get_local_path("tokenizer.json")?
+) -> Result<Box<dyn ModelLoader>> {
+    let (text_cfg, vision_cfg, image_token_id) = parse_dense_config(repo.as_ref()).await?;
+    let tokenizer_path = repo.get_local_path("tokenizer.json").await?
         .context("tokenizer.json not found")?;
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?;
-
-    let pad_token_id = tokenizer.token_to_id("<|endoftext|>").context("'<|endoftext|>' not in tokenizer vocab")? as i64;
-
-    let score_weight = if matches!(id, ModelIds::Qwen3VLReranker) {
-        Some(build_score_weight(&ws, &tokenizer)?)
-    } else {
-        None
-    };
-
-    let model = Arc::new(build_dense_text_model(&ws, &text_cfg)?);
-    let vision = Some(Arc::new(build_vision_model(&ws, &vision_cfg)?));
-
-    Ok(Box::new(Qwen3VLBuilder {
-        id,
-        model,
-        vision,
-        score_weight,
-        pad_token_id,
-        image_token_id,
-        spatial_merge_size: vision_cfg.spatial_merge_size,
-    }))
+    let shard_paths = resolve_shard_paths(repo.as_ref()).await?;
+    Ok(Box::new(Qwen3VLDenseModelLoader { id, text_cfg, vision_cfg, image_token_id, tokenizer, shard_paths }))
 }
 
 async fn load_moe_builder(
-    repo: Box<dyn crate::transformers::traits::ModelRepo>,
-    device: tch::Device,
-) -> Result<Box<dyn LocalModelBuilder>> {
-    let (text_cfg, vision_cfg, image_token_id) = parse_moe_config(repo.as_ref())?;
-    let ws = WeightMap::load(repo.as_ref(), device)?;
-
-    let tokenizer_path: PathBuf = repo
-        .get_local_path("tokenizer.json")?
+    repo: Box<dyn ModelRepo>,
+) -> Result<Box<dyn ModelLoader>> {
+    let (text_cfg, vision_cfg, image_token_id) = parse_moe_config(repo.as_ref()).await?;
+    let tokenizer_path = repo.get_local_path("tokenizer.json").await?
         .context("tokenizer.json not found")?;
-    let pad_token_id = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?
-        .token_to_id("<|endoftext|>").context("'<|endoftext|>' not in tokenizer vocab")? as i64;
-
-    let model = Arc::new(build_moe_text_model(&ws, &text_cfg)?);
-    let vision = Some(Arc::new(build_vision_model(&ws, &vision_cfg)?));
-
-    Ok(Box::new(Qwen3VLMoeBuilder {
-        model,
-        vision,
-        pad_token_id,
-        image_token_id,
-        spatial_merge_size: vision_cfg.spatial_merge_size,
-    }))
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?;
+    let shard_paths = resolve_shard_paths(repo.as_ref()).await?;
+    Ok(Box::new(Qwen3VLMoeModelLoader { text_cfg, vision_cfg, image_token_id, tokenizer, shard_paths }))
 }
 
 // ---------------------------------------------------------------------------
@@ -803,12 +849,9 @@ async fn load_moe_builder(
 pub struct Qwen3VLEmbeddingFactory;
 
 impl ModelFactory for Qwen3VLEmbeddingFactory {
-    fn identifier(&self) -> Option<ModelIds> {
-        Some(ModelIds::Qwen3VLEmbedding)
-    }
-
-    fn load(repo: Box<dyn crate::transformers::traits::ModelRepo>, device: tch::Device) -> PinnedFuture<Box<dyn LocalModelBuilder>> {
-        Box::pin(load_dense_builder(repo, device, ModelIds::Qwen3VLEmbedding))
+    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLEmbedding) }
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=Result<Box<dyn ModelLoader>>> + 'a>> {
+        Box::pin(load_dense_builder(repo, self.identifier().unwrap()))
     }
 }
 
@@ -816,12 +859,9 @@ impl ModelFactory for Qwen3VLEmbeddingFactory {
 pub struct Qwen3VLRerankerFactory;
 
 impl ModelFactory for Qwen3VLRerankerFactory {
-    fn identifier(&self) -> Option<ModelIds> {
-        Some(ModelIds::Qwen3VLReranker)
-    }
-
-    fn load(repo: Box<dyn crate::transformers::traits::ModelRepo>, device: tch::Device) -> PinnedFuture<Box<dyn LocalModelBuilder>> {
-        Box::pin(load_dense_builder(repo, device, ModelIds::Qwen3VLReranker))
+    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLReranker) }
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=Result<Box<dyn ModelLoader>>> + 'a>> {
+        Box::pin(load_dense_builder(repo, self.identifier().unwrap()))
     }
 }
 
@@ -829,25 +869,16 @@ impl ModelFactory for Qwen3VLRerankerFactory {
 pub struct Qwen3VLMoeFactory;
 
 impl ModelFactory for Qwen3VLMoeFactory {
-    fn identifier(&self) -> Option<ModelIds> {
-        Some(ModelIds::Qwen3VLMoe)
-    }
-
-    fn load(repo: Box<dyn crate::transformers::traits::ModelRepo>, device: tch::Device) -> PinnedFuture<Box<dyn LocalModelBuilder>> {
-        Box::pin(load_moe_builder(repo, device))
+    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLMoe) }
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=Result<Box<dyn ModelLoader>>> + 'a>> {
+        Box::pin(load_moe_builder(repo))
     }
 }
 
 #[cfg(test)]
 /// Loads the dense `TextModel` from a local directory for use in tests.
-pub(crate) fn load_text_model_from_dir(p: &std::path::Path) -> Result<dense::TextModel> {
-    struct Dir(std::path::PathBuf);
-    impl crate::transformers::traits::ModelRepo for Dir {
-        fn identifier(&self) -> Option<crate::transformers::model_ids::ModelIds> { None }
-        fn get_local_path(&self, n: &str) -> Result<Option<std::path::PathBuf>> {
-            Ok(Some(self.0.join(n)))
-        }
-    }
-    let (cfg, _, _) = parse_dense_config(&Dir(p.to_owned()))?;
-    build_dense_text_model(&WeightMap::load(&Dir(p.to_owned()), tch::Device::Cpu)?, &cfg)
+pub(crate) async fn load_text_model_from_dir(p: &std::path::Path) -> Result<dense::TextModel> {
+    let repo = init_repo(p).await?;
+    let (cfg, _, _) = parse_dense_config(repo.as_ref()).await?;
+    build_dense_text_model(&WeightMap::load(repo.as_ref(), tch::Device::Cpu).await?, &cfg)
 }
