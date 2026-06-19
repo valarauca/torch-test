@@ -1,14 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use hf_hub::{api::tokio::Api, Repo as HFRepo};
-
-use crate::transformers::traits::ModelRepo;
+use hf_hub::{Repo as HFRepo, api::tokio::Api};
 use local::LocalRepo;
 use remote::RemoteRepo;
 
-pub mod remote;
-pub mod local;
+use crate::transformers::traits::ModelRepo;
 
+pub mod local;
+pub mod remote;
 
 pub enum Repo {
     Local(PathBuf),

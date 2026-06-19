@@ -1,13 +1,8 @@
-use std::{
-    path::Path,
-    rc::{Rc},
-    ops::Deref,
-};
-use tch::{Kind};
-use mmap_guard::{FileData,map_file};
-use anamnesis::parse::safetensors::{
-    SafetensorsHeader,parse_safetensors_header,Dtype,
-};
+use std::{ops::Deref, path::Path, rc::Rc};
+
+use anamnesis::parse::safetensors::{Dtype, SafetensorsHeader, parse_safetensors_header};
+use mmap_guard::{FileData, map_file};
+use tch::Kind;
 
 /// Wrapper around safe tensor data
 #[derive(Clone)]
@@ -22,38 +17,35 @@ struct InnerSafeTensor {
     header: SafetensorsHeader,
 }
 impl SafeTensor {
-
     /// Load a safe tensor file
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let guard = map_file(path)?;
-        let header = parse_safetensors_header(&guard)?;       
+        let header = parse_safetensors_header(&guard)?;
         let t = InnerSafeTensor { header, guard };
         Ok(Self { rc: Rc::new(t) })
     }
 
     /// Returns the tch `Kind` for a named tensor, or `None` if not present.
     pub fn kind_of(&self, name: &str) -> Option<tch::Kind> {
-        let dtype = self.rc.header.tensors.iter()
-            .find(|e| e.name.as_str() == name)?
-            .dtype;
+        let dtype = self.rc.header.tensors.iter().find(|e| e.name.as_str() == name)?.dtype;
         match dtype {
-            Dtype::BF16   => Some(tch::Kind::BFloat16),
-            Dtype::F16    => Some(tch::Kind::Half),
-            Dtype::F32    => Some(tch::Kind::Float),
-            Dtype::F64    => Some(tch::Kind::Double),
-            Dtype::Bool   => Some(tch::Kind::Bool),
-            Dtype::U8     => Some(tch::Kind::Uint8),
-            Dtype::I8     => Some(tch::Kind::Int8),
-            Dtype::I16    => Some(tch::Kind::Int16),
-            Dtype::I32    => Some(tch::Kind::Int),
-            Dtype::I64    => Some(tch::Kind::Int64),
+            Dtype::BF16 => Some(tch::Kind::BFloat16),
+            Dtype::F16 => Some(tch::Kind::Half),
+            Dtype::F32 => Some(tch::Kind::Float),
+            Dtype::F64 => Some(tch::Kind::Double),
+            Dtype::Bool => Some(tch::Kind::Bool),
+            Dtype::U8 => Some(tch::Kind::Uint8),
+            Dtype::I8 => Some(tch::Kind::Int8),
+            Dtype::I16 => Some(tch::Kind::Int16),
+            Dtype::I32 => Some(tch::Kind::Int),
+            Dtype::I64 => Some(tch::Kind::Int64),
             Dtype::F8E5M2 => Some(tch::Kind::Float8e5m2),
-            _             => None,
+            _ => None,
         }
     }
 
     /// returns tensor names
-    pub fn names<'a>(&'a self) -> impl Iterator<Item=&'a str> {
+    pub fn names<'a>(&'a self) -> impl Iterator<Item = &'a str> {
         self.rc.header.tensors.iter().map(|entry| entry.name.as_str())
     }
 
@@ -66,24 +58,24 @@ impl SafeTensor {
             None => return Ok(None),
             Some(e) => e,
         };
-        match (entry.dtype,kind) {
-            (Dtype::BF16,Kind::BFloat16) |
-            (Dtype::F16,Kind::Half) |
-            (Dtype::F32,Kind::Float) |
-            (Dtype::F64,Kind::Double) |
-            (Dtype::Bool,Kind::Bool) |
-            (Dtype::U8,Kind::Uint8) |
-            (Dtype::I8,Kind::Int8) |
-            (Dtype::I16,Kind::Int16) |
-            (Dtype::I32,Kind::Int) |
-            (Dtype::I64,Kind::Int64)|
-            (Dtype::F8E5M2,Kind::Float8e5m2) => { },
-            (input,request) => {
+        match (entry.dtype, kind) {
+            (Dtype::BF16, Kind::BFloat16)
+            | (Dtype::F16, Kind::Half)
+            | (Dtype::F32, Kind::Float)
+            | (Dtype::F64, Kind::Double)
+            | (Dtype::Bool, Kind::Bool)
+            | (Dtype::U8, Kind::Uint8)
+            | (Dtype::I8, Kind::Int8)
+            | (Dtype::I16, Kind::Int16)
+            | (Dtype::I32, Kind::Int)
+            | (Dtype::I64, Kind::Int64)
+            | (Dtype::F8E5M2, Kind::Float8e5m2) => {}
+            (input, request) => {
                 anyhow::bail!("cannot tensor '{}' requested '{:?}' file contains '{:?}'", name, request, input);
             }
         };
         // re-allocate shape & strides
-        let shape = entry.shape.iter().map(|&d|d as i64).collect::<Vec<i64>>();
+        let shape = entry.shape.iter().map(|&d| d as i64).collect::<Vec<i64>>();
         let mut strides = vec![1i64; shape.len()];
         for i in (0..shape.len().saturating_sub(1)).rev() {
             strides[i] = strides[i + 1] * shape[i + 1] as i64;
@@ -102,15 +94,7 @@ impl SafeTensor {
         //    in-place PyTorch op through Deref will SIGSEGV rather than silently corrupt the map.
         // 3. Alignment: safetensors pads every tensor's data region to 8-byte boundaries,
         //    covering all dtypes matched above (max alignment requirement: 8 bytes for F64/I64).
-        let tensor = unsafe {
-            tch::Tensor::f_from_blob(
-                data.as_ptr(),
-                &shape,
-                &strides,
-                kind,
-                device,
-            )?
-        };
+        let tensor = unsafe { tch::Tensor::f_from_blob(data.as_ptr(), &shape, &strides, kind, device)? };
         Ok(Some(TensorWrapper {
             // keep a reference to the memory map around
             map: self.clone(),
@@ -127,5 +111,7 @@ pub struct TensorWrapper {
 }
 impl std::ops::Deref for TensorWrapper {
     type Target = tch::Tensor;
-    fn deref(&self) -> &Self::Target { &self.tensor }
+    fn deref(&self) -> &Self::Target {
+        &self.tensor
+    }
 }

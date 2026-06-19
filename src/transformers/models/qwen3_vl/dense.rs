@@ -25,7 +25,7 @@ impl Default for TextConfig {
             num_attention_heads: 32,
             num_key_value_heads: 8,
             head_dim: 128,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps: 1.0e-6,
             rope_theta: 500_000.0,
             mrope_section: [24, 20, 20],
         }
@@ -71,8 +71,7 @@ pub struct RotaryEmbedding {
 impl RotaryEmbedding {
     /// inv_freq[i] = 1 / θ^(2i / head_dim)
     pub fn new(head_dim: i64, theta: f64, mrope_section: [i64; 3], device: tch::Device) -> Self {
-        let exponents = Tensor::arange(head_dim / 2, (Kind::Float, device))
-            .f_mul_scalar(2.0 / head_dim as f64).unwrap();
+        let exponents = Tensor::arange(head_dim / 2, (Kind::Float, device)).f_mul_scalar(2.0 / head_dim as f64).unwrap();
         let inv_freq = exponents.f_mul_scalar(theta.ln()).unwrap().exp().reciprocal();
         Self { inv_freq, mrope_section }
     }
@@ -86,9 +85,7 @@ impl RotaryEmbedding {
     pub fn forward(&self, position_ids: &Tensor) -> (Tensor, Tensor) {
         let batch = position_ids.size()[1];
         let d_half = self.inv_freq.size()[0];
-        let inv = self.inv_freq
-            .unsqueeze(0).unsqueeze(0).unsqueeze(-1)
-            .expand([3, batch, d_half, 1], false);
+        let inv = self.inv_freq.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand([3, batch, d_half, 1], false);
         let pos = position_ids.unsqueeze(2).to_kind(Kind::Float);
         let freqs = inv.matmul(&pos).transpose(2, 3);
         let interleaved = apply_interleaved_mrope(&freqs, &self.mrope_section);
@@ -117,12 +114,7 @@ fn rotate_half(x: &Tensor) -> Tensor {
 }
 
 /// Applies RoPE to query and key.  cos/sin: [batch, seq, head_dim].
-pub fn apply_rotary_pos_emb(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> (Tensor, Tensor) {
+pub fn apply_rotary_pos_emb(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> (Tensor, Tensor) {
     let kind = q.kind();
     let cos = cos.unsqueeze(1).to_kind(kind);
     let sin = sin.unsqueeze(1).to_kind(kind);
@@ -174,33 +166,26 @@ impl Attention {
         let scale = (self.head_dim as f64).powf(-0.5);
         let device = x.device();
 
-        let q = self.q_norm
+        let q = self
+            .q_norm
             .forward(&self.q_proj.forward(x).reshape([batch, seq, self.num_heads, self.head_dim]))
             .transpose(1, 2);
-        let k = self.k_norm
+        let k = self
+            .k_norm
             .forward(&self.k_proj.forward(x).reshape([batch, seq, self.num_kv_heads, self.head_dim]))
             .transpose(1, 2);
-        let v = self.v_proj.forward(x)
-            .reshape([batch, seq, self.num_kv_heads, self.head_dim])
-            .transpose(1, 2);
+        let v = self.v_proj.forward(x).reshape([batch, seq, self.num_kv_heads, self.head_dim]).transpose(1, 2);
 
         let (q, k) = apply_rotary_pos_emb(&q, &k, cos, sin);
         let k = repeat_kv(&k, n_rep);
         let v = repeat_kv(&v, n_rep);
 
-        let causal_mask = Tensor::ones([seq, seq], (Kind::Bool, device))
-            .tril(0)
-            .logical_not()
-            .unsqueeze(0)
-            .unsqueeze(0);
+        let causal_mask = Tensor::ones([seq, seq], (Kind::Bool, device)).tril(0).logical_not().unsqueeze(0).unsqueeze(0);
 
         let orig_kind = q.kind();
         let logits = q.matmul(&k.transpose(-2, -1)) * scale;
         let logits = logits.masked_fill(&causal_mask, f64::NEG_INFINITY);
-        let attn = logits
-            .softmax(-1, Kind::Float)
-            .to_kind(orig_kind)
-            .matmul(&v);
+        let attn = logits.softmax(-1, Kind::Float).to_kind(orig_kind).matmul(&v);
 
         let out = attn.transpose(1, 2).contiguous().reshape([batch, seq, -1]);
         self.o_proj.forward(&out)
@@ -240,9 +225,7 @@ impl TextModel {
         let (batch, seq) = input_ids.size2().unwrap();
         let device = input_ids.device();
 
-        let pos_1d = Tensor::arange(seq, (Kind::Int64, device))
-            .unsqueeze(0)
-            .expand([batch, -1], false);
+        let pos_1d = Tensor::arange(seq, (Kind::Int64, device)).unsqueeze(0).expand([batch, -1], false);
         let position_ids = pos_1d.unsqueeze(0).expand([3, -1, -1], false);
         let (cos, sin) = self.rotary_emb.forward(&position_ids);
 
@@ -263,14 +246,7 @@ impl TextModel {
     /// image_features:     [num_image_tokens, hidden_size]
     /// deepstack_features: one tensor per layer [num_image_tokens, hidden_size]
     /// image_token_id:     the placeholder token ID used in input_ids for image patches
-    pub fn forward_multimodal(
-        &self,
-        input_ids: &Tensor,
-        mrope_position_ids: &Tensor,
-        image_features: &Tensor,
-        deepstack_features: &[Tensor],
-        image_token_id: i64,
-    ) -> Tensor {
+    pub fn forward_multimodal(&self, input_ids: &Tensor, mrope_position_ids: &Tensor, image_features: &Tensor, deepstack_features: &[Tensor], image_token_id: i64) -> Tensor {
         let (batch, seq) = input_ids.size2().unwrap();
         let device = input_ids.device();
         let hidden_size = image_features.size()[1];
@@ -292,9 +268,7 @@ impl TextModel {
                 let h_flat = h.reshape([-1, hidden_size]);
                 let visual_h = h_flat.index(&[Some(image_mask.shallow_clone())]);
                 let updated = visual_h + feat;
-                h = h_flat
-                    .index_put(&[Some(image_mask.shallow_clone())], &updated, false)
-                    .reshape([batch, seq, hidden_size]);
+                h = h_flat.index_put(&[Some(image_mask.shallow_clone())], &updated, false).reshape([batch, seq, hidden_size]);
             }
         }
 

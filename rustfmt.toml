@@ -1,0 +1,9 @@
+max_width = 175
+fn_call_width = 170
+fn_params_layout = "Compressed"
+hard_tabs = false
+tab_spaces = 4
+group_imports = "StdExternalCrate"
+newline_style = "Unix"
+float_literal_trailing_zero = "Always"
+hex_literal_case = "Upper"

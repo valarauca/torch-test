@@ -1,35 +1,27 @@
-use std::{
-    path::{PathBuf},
-    future::{Future},
-    pin::Pin,
-    any::Any,
-};
+use std::{any::Any, future::Future, path::PathBuf, pin::Pin};
 
-use super::model_ids::{ModelIds};
+use super::model_ids::ModelIds;
 
-
-pub type PinnedFuture<T> = Pin<Box<dyn Future<Output=anyhow::Result<T>> + 'static + Send>>;
+pub type PinnedFuture<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + 'static + Send>>;
 
 /// Something that represents represents the repo
 pub trait ModelRepo: 'static + Sync + Send {
-
     /// What model are we working with
     fn identifier(&self) -> Option<ModelIds>;
 
     /// Returns the path of this item within a repo.
     ///
     /// Function is `async` as to permit downloading behind the scenes if the model is remote
-    fn get_local_path<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output=anyhow::Result<Option<PathBuf>>> + 'a>>;
+    fn get_local_path<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<PathBuf>>> + 'a>>;
 }
 
 /// ModelFactory constructs the underly model
 pub trait ModelFactory: 'static + Sync + Send {
-
     /// What model are we working with
     fn identifier(&self) -> Option<ModelIds>;
 
     /// Load a model.
-    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=anyhow::Result<Box<dyn ModelLoader>>> + 'a>>;
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output = anyhow::Result<Box<dyn ModelLoader>>> + 'a>>;
 }
 
 /// Handles loading a model's tensors into memory
@@ -43,7 +35,6 @@ pub trait ModelLoader: 'static + Send {
 /// Represents a model is "ready to run".
 /// When this type is dropped all tensors should be unloaded.
 pub trait LocalModelBuilder: 'static {
-
     fn identifier(&self) -> Option<ModelIds>;
 
     fn text_tokenizer(&self) -> Option<Box<dyn TextTokenizer>>;
@@ -73,7 +64,7 @@ pub trait LocalModelBuilder: 'static {
 pub enum EmbeddingScheme {
     NoInput,
     QueryOnly(tch::Tensor),
-    QueryAndInstruct(tch::Tensor,tch::Tensor),
+    QueryAndInstruct(tch::Tensor, tch::Tensor),
 }
 
 pub trait TextTokenizer: 'static {
@@ -84,14 +75,11 @@ pub trait TextTokenizer: 'static {
 }
 
 pub trait ImageTokenizer: 'static {
-
     fn encode(&self, img: &image::DynamicImage) -> anyhow::Result<Box<dyn TokenizedData>>;
 }
 
 /// General wrapper for model tokenized data
-pub trait TokenizedData: 'static + Any {
-}
-
+pub trait TokenizedData: 'static + Any {}
 
 /*
  * Embedding Models

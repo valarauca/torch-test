@@ -25,9 +25,7 @@ pub struct MoeTextConfig {
 
 /// Returns true when layer `i` uses a SparseMoeBlock rather than a dense Mlp.
 pub fn is_moe_layer(i: usize, cfg: &MoeTextConfig) -> bool {
-    !cfg.mlp_only_layers.contains(&i)
-        && cfg.num_experts > 0
-        && (i + 1) % cfg.decoder_sparse_step == 0
+    !cfg.mlp_only_layers.contains(&i) && cfg.num_experts > 0 && (i + 1) % cfg.decoder_sparse_step == 0
 }
 
 /// All expert weights stacked into 3-D tensors:
@@ -43,12 +41,7 @@ impl Experts {
     /// hidden_states: [num_tokens, hidden_size]
     /// top_k_index:   [num_tokens, top_k]  (Int64)
     /// top_k_weights: [num_tokens, top_k]  (same dtype as hidden_states)
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor,
-        top_k_index: &Tensor,
-        top_k_weights: &Tensor,
-    ) -> Tensor {
+    pub fn forward(&self, hidden_states: &Tensor, top_k_index: &Tensor, top_k_weights: &Tensor) -> Tensor {
         let num_experts = self.gate_up_proj.size()[0];
         let d_e = self.gate_up_proj.size()[1] / 2;
         let device = hidden_states.device();
@@ -56,10 +49,7 @@ impl Experts {
 
         let expert_mask = top_k_index.one_hot(num_experts).permute([2i64, 1, 0].as_ref());
 
-        let expert_hit = expert_mask
-            .sum_dim_intlist([1i64, 2].as_ref(), false, Kind::Int64)
-            .gt(0)
-            .nonzero();
+        let expert_hit = expert_mask.sum_dim_intlist([1i64, 2].as_ref(), false, Kind::Int64).gt(0).nonzero();
 
         for i in 0..expert_hit.size()[0] {
             let expert_idx = expert_hit.int64_value(&[i, 0]);
@@ -73,8 +63,7 @@ impl Experts {
 
             let current = hidden_states.index_select(0, &token_idx);
 
-            let gate_up =
-                current.linear(&self.gate_up_proj.select(0, expert_idx), None::<&Tensor>);
+            let gate_up = current.linear(&self.gate_up_proj.select(0, expert_idx), None::<&Tensor>);
             let gate = gate_up.narrow(1, 0, d_e);
             let up = gate_up.narrow(1, d_e, d_e);
             let h = gate.silu() * up;
@@ -83,10 +72,7 @@ impl Experts {
 
             let n = token_idx.size()[0];
             let row = Tensor::arange(n, (Kind::Int64, device));
-            let w = top_k_weights
-                .index_select(0, &token_idx)
-                .index(&[Some(row), Some(top_k_pos)])
-                .unsqueeze(-1);
+            let w = top_k_weights.index_select(0, &token_idx).index(&[Some(row), Some(top_k_pos)]).unsqueeze(-1);
 
             let _ = output.index_add_(0, &token_idx, &(out * w).to_kind(output.kind()));
         }
@@ -172,9 +158,7 @@ impl MoeTextModel {
         let (batch, seq) = input_ids.size2().unwrap();
         let device = input_ids.device();
 
-        let pos_1d = Tensor::arange(seq, (Kind::Int64, device))
-            .unsqueeze(0)
-            .expand([batch, -1], false);
+        let pos_1d = Tensor::arange(seq, (Kind::Int64, device)).unsqueeze(0).expand([batch, -1], false);
         let position_ids = pos_1d.unsqueeze(0).expand([3, -1, -1], false);
         let (cos, sin) = self.rotary_emb.forward(&position_ids);
 
@@ -195,14 +179,7 @@ impl MoeTextModel {
     /// image_features:     [num_image_tokens, hidden_size]
     /// deepstack_features: one tensor per layer [num_image_tokens, hidden_size]
     /// image_token_id:     the placeholder token ID used in input_ids for image patches
-    pub fn forward_multimodal(
-        &self,
-        input_ids: &Tensor,
-        mrope_position_ids: &Tensor,
-        image_features: &Tensor,
-        deepstack_features: &[Tensor],
-        image_token_id: i64,
-    ) -> Tensor {
+    pub fn forward_multimodal(&self, input_ids: &Tensor, mrope_position_ids: &Tensor, image_features: &Tensor, deepstack_features: &[Tensor], image_token_id: i64) -> Tensor {
         let (batch, seq) = input_ids.size2().unwrap();
         let device = input_ids.device();
         let hidden_size = image_features.size()[1];
@@ -224,9 +201,7 @@ impl MoeTextModel {
                 let h_flat = h.reshape([-1, hidden_size]);
                 let visual_h = h_flat.index(&[Some(image_mask.shallow_clone())]);
                 let updated = visual_h + feat;
-                h = h_flat
-                    .index_put(&[Some(image_mask.shallow_clone())], &updated, false)
-                    .reshape([batch, seq, hidden_size]);
+                h = h_flat.index_put(&[Some(image_mask.shallow_clone())], &updated, false).reshape([batch, seq, hidden_size]);
             }
         }
 

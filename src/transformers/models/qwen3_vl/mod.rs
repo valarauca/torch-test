@@ -8,26 +8,17 @@ mod tests_qwen3_dense;
 use std::{collections::HashSet, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::{Context, Result};
+use dense::{Attention, DecoderLayer, Linear, Mlp, RmsNorm, RotaryEmbedding, TextConfig, TextModel};
+use moe::{Experts, LayerMlp, MoeDecoderLayer, MoeTextConfig, MoeTextModel, SparseMoeBlock, TopKRouter, is_moe_layer};
 use tch::{Kind, Tensor};
+use vision::{Conv3d, LayerNorm, PatchMerger, VisionAttention, VisionBlock, VisionConfig, VisionMlp, VisionModel, VisionPatchEmbed, VisionRotaryEmbedding};
 
 use crate::tensors::SafeTensor;
-use crate::transformers::{
-    model_ids::ModelIds,
-    traits::{
-        EmbeddingModel, EmbeddingScheme, ImageTokenizer, LocalModelBuilder, ModelFactory,
-        ModelLoader, ModelRepo, RankingModel, TextTokenizer, TokenizedData,
-    },
-};
 #[cfg(test)]
 use crate::transformers::repo::init_repo;
-use dense::{Attention, DecoderLayer, Linear, Mlp, RotaryEmbedding, RmsNorm, TextConfig, TextModel};
-use moe::{
-    Experts, LayerMlp, MoeDecoderLayer, MoeTextConfig, MoeTextModel, SparseMoeBlock, TopKRouter,
-    is_moe_layer,
-};
-use vision::{
-    Conv3d, LayerNorm, PatchMerger, VisionAttention, VisionBlock, VisionConfig, VisionMlp,
-    VisionModel, VisionPatchEmbed, VisionRotaryEmbedding,
+use crate::transformers::{
+    model_ids::ModelIds,
+    traits::{EmbeddingModel, EmbeddingScheme, ImageTokenizer, LocalModelBuilder, ModelFactory, ModelLoader, ModelRepo, RankingModel, TextTokenizer, TokenizedData},
 };
 
 // ---------------------------------------------------------------------------
@@ -49,20 +40,18 @@ impl WeightMap {
             shards.push(SafeTensor::load(&path)?);
         } else {
             let idx_path = repo
-                .get_local_path("model.safetensors.index.json").await?
+                .get_local_path("model.safetensors.index.json")
+                .await?
                 .context("neither model.safetensors nor model.safetensors.index.json found")?;
 
             let idx_str = std::fs::read_to_string(&idx_path)?;
             let idx: serde_json::Value = serde_json::from_str(&idx_str)?;
             let weight_map = idx["weight_map"].as_object().context("invalid index: missing weight_map")?;
 
-            let shard_names: HashSet<&str> = weight_map.values()
-                .filter_map(|v| v.as_str())
-                .collect();
+            let shard_names: HashSet<&str> = weight_map.values().filter_map(|v| v.as_str()).collect();
 
             for shard_name in shard_names {
-                let path = repo.get_local_path(shard_name).await?
-                    .with_context(|| format!("shard not found: {shard_name}"))?;
+                let path = repo.get_local_path(shard_name).await?.with_context(|| format!("shard not found: {shard_name}"))?;
                 shards.push(SafeTensor::load(&path)?);
             }
         }
@@ -79,9 +68,7 @@ impl WeightMap {
     fn get(&self, name: &str) -> Result<Tensor> {
         for shard in &self.shards {
             if let Some(kind) = shard.kind_of(name) {
-                let wrapper = shard
-                    .get_tensor(name, kind, tch::Device::Cpu)?
-                    .unwrap();
+                let wrapper = shard.get_tensor(name, kind, tch::Device::Cpu)?.unwrap();
                 let mut out = Tensor::empty(wrapper.size().as_slice(), (kind, self.device));
                 out.copy_(&*wrapper);
                 return Ok(out);
@@ -99,16 +86,20 @@ async fn resolve_shard_paths(repo: &dyn ModelRepo) -> Result<Vec<PathBuf>> {
     if let Some(path) = repo.get_local_path("model.safetensors").await? {
         return Ok(vec![path]);
     }
-    let idx_path = repo.get_local_path("model.safetensors.index.json").await?
+    let idx_path = repo
+        .get_local_path("model.safetensors.index.json")
+        .await?
         .context("neither model.safetensors nor model.safetensors.index.json found")?;
     let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(idx_path)?)?;
-    let shard_names: HashSet<&str> = idx["weight_map"].as_object()
+    let shard_names: HashSet<&str> = idx["weight_map"]
+        .as_object()
         .context("invalid index: missing weight_map")?
-        .values().filter_map(|v| v.as_str()).collect();
+        .values()
+        .filter_map(|v| v.as_str())
+        .collect();
     let mut paths = Vec::new();
     for name in shard_names {
-        paths.push(repo.get_local_path(name).await?
-            .with_context(|| format!("shard not found: {name}"))?);
+        paths.push(repo.get_local_path(name).await?.with_context(|| format!("shard not found: {name}"))?);
     }
     Ok(paths)
 }
@@ -125,14 +116,17 @@ fn linear(ws: &WeightMap, prefix: &str, has_bias: bool) -> Result<Linear> {
 }
 
 fn rms_norm(ws: &WeightMap, prefix: &str, eps: f64) -> Result<RmsNorm> {
-    Ok(RmsNorm { weight: ws.get(&format!("{prefix}.weight"))?, eps })
+    Ok(RmsNorm {
+        weight: ws.get(&format!("{prefix}.weight"))?,
+        eps,
+    })
 }
 
 fn layer_norm(ws: &WeightMap, prefix: &str) -> Result<LayerNorm> {
     Ok(LayerNorm {
         weight: ws.get(&format!("{prefix}.weight"))?,
         bias: ws.get(&format!("{prefix}.bias"))?,
-        eps: 1e-6,
+        eps: 1.0e-6,
     })
 }
 
@@ -190,12 +184,7 @@ fn build_vision_model(ws: &WeightMap, cfg: &VisionConfig) -> Result<VisionModel>
 
     let mut deepstack_merger_list = Vec::with_capacity(cfg.deepstack_visual_indexes.len());
     for j in 0..cfg.deepstack_visual_indexes.len() {
-        deepstack_merger_list.push(patch_merger(
-            ws,
-            &format!("{vp}.deepstack_merger_list.{j}"),
-            merged_size,
-            true,
-        )?);
+        deepstack_merger_list.push(patch_merger(ws, &format!("{vp}.deepstack_merger_list.{j}"), merged_size, true)?);
     }
 
     Ok(VisionModel {
@@ -216,7 +205,7 @@ fn build_vision_model(ws: &WeightMap, cfg: &VisionConfig) -> Result<VisionModel>
 // Pool the last non-padding token from [batch, seq, hidden] hidden states.
 // ---------------------------------------------------------------------------
 
-fn pool_last(hidden: &Tensor, attention_mask: &Tensor) -> Tensor {
+pub(crate) fn pool_last(hidden: &Tensor, attention_mask: &Tensor) -> Tensor {
     let seq_len = attention_mask.size()[1];
     let last_pos = attention_mask.flip([1i64].as_ref()).argmax(1, false);
     let col = last_pos.neg() + (seq_len - 1);
@@ -229,12 +218,8 @@ fn pool_last(hidden: &Tensor, attention_mask: &Tensor) -> Tensor {
 // Dense: config, text model, score weight
 // ---------------------------------------------------------------------------
 
-async fn parse_dense_config(
-    repo: &dyn ModelRepo,
-) -> Result<(TextConfig, VisionConfig, i64)> {
-    let path = repo
-        .get_local_path("config.json").await?
-        .context("config.json not found")?;
+async fn parse_dense_config(repo: &dyn ModelRepo) -> Result<(TextConfig, VisionConfig, i64)> {
+    let path = repo.get_local_path("config.json").await?.context("config.json not found")?;
     let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     let tc = &raw["text_config"];
     let vc = &raw["vision_config"];
@@ -243,13 +228,7 @@ async fn parse_dense_config(
 
     let mrope_section = tc["rope_scaling"]["mrope_section"]
         .as_array()
-        .and_then(|a| {
-            if a.len() == 3 {
-                Some([a[0].as_i64()?, a[1].as_i64()?, a[2].as_i64()?])
-            } else {
-                None
-            }
-        })
+        .and_then(|a| if a.len() == 3 { Some([a[0].as_i64()?, a[1].as_i64()?, a[2].as_i64()?]) } else { None })
         .context("rope_scaling.mrope_section missing or malformed in config.json")?;
 
     let text_cfg = TextConfig {
@@ -291,10 +270,10 @@ fn build_dense_text_model(ws: &WeightMap, cfg: &TextConfig) -> Result<TextModel>
             },
             mlp: Mlp {
                 gate_proj: linear(ws, &format!("{l}.mlp.gate_proj"), false)?,
-                up_proj:   linear(ws, &format!("{l}.mlp.up_proj"),   false)?,
+                up_proj: linear(ws, &format!("{l}.mlp.up_proj"), false)?,
                 down_proj: linear(ws, &format!("{l}.mlp.down_proj"), false)?,
             },
-            input_norm:    rms_norm(ws, &format!("{l}.input_layernorm"),          cfg.rms_norm_eps)?,
+            input_norm: rms_norm(ws, &format!("{l}.input_layernorm"), cfg.rms_norm_eps)?,
             post_attn_norm: rms_norm(ws, &format!("{l}.post_attention_layernorm"), cfg.rms_norm_eps)?,
         });
     }
@@ -310,7 +289,7 @@ fn build_dense_text_model(ws: &WeightMap, cfg: &TextConfig) -> Result<TextModel>
 /// Builds the (yes − no) score vector from the lm_head for binary ranking.
 fn build_score_weight(ws: &WeightMap, tokenizer: &tokenizers::Tokenizer) -> Result<Tensor> {
     let yes_id = tokenizer.token_to_id("yes").context("'yes' not in tokenizer vocab")? as i64;
-    let no_id  = tokenizer.token_to_id("no").context("'no' not in tokenizer vocab")? as i64;
+    let no_id = tokenizer.token_to_id("no").context("'no' not in tokenizer vocab")? as i64;
     let lm_head = ws.get("lm_head.weight")?;
     Ok((lm_head.select(0, yes_id) - lm_head.select(0, no_id)).unsqueeze(0))
 }
@@ -319,19 +298,13 @@ fn build_score_weight(ws: &WeightMap, tokenizer: &tokenizers::Tokenizer) -> Resu
 // MoE: config, text model
 // ---------------------------------------------------------------------------
 
-async fn parse_moe_config(
-    repo: &dyn ModelRepo,
-) -> Result<(MoeTextConfig, VisionConfig, i64)> {
-    let path = repo
-        .get_local_path("config.json").await?
-        .context("config.json not found")?;
+async fn parse_moe_config(repo: &dyn ModelRepo) -> Result<(MoeTextConfig, VisionConfig, i64)> {
+    let path = repo.get_local_path("config.json").await?.context("config.json not found")?;
     let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     let tc = &raw["text_config"];
     let vc = &raw["vision_config"];
 
-    let num_attention_heads = tc["num_attention_heads"]
-        .as_i64()
-        .context("num_attention_heads")?;
+    let num_attention_heads = tc["num_attention_heads"].as_i64().context("num_attention_heads")?;
 
     let num_experts = tc["num_local_experts"]
         .as_i64()
@@ -347,13 +320,7 @@ async fn parse_moe_config(
 
     let mrope_section = tc["rope_scaling"]["mrope_section"]
         .as_array()
-        .and_then(|a| {
-            if a.len() == 3 {
-                Some([a[0].as_i64()?, a[1].as_i64()?, a[2].as_i64()?])
-            } else {
-                None
-            }
-        })
+        .and_then(|a| if a.len() == 3 { Some([a[0].as_i64()?, a[1].as_i64()?, a[2].as_i64()?]) } else { None })
         .context("rope_scaling.mrope_section missing or malformed in config.json")?;
 
     let text_cfg = MoeTextConfig {
@@ -367,12 +334,8 @@ async fn parse_moe_config(
         rope_theta: tc["rope_theta"].as_f64().unwrap_or(500_000.0),
         mrope_section,
         decoder_sparse_step: tc["decoder_sparse_step"].as_u64().unwrap_or(1) as usize,
-        moe_intermediate_size: tc["moe_intermediate_size"]
-            .as_i64()
-            .context("moe_intermediate_size")?,
-        num_experts_per_tok: tc["num_experts_per_tok"]
-            .as_i64()
-            .context("num_experts_per_tok")?,
+        moe_intermediate_size: tc["moe_intermediate_size"].as_i64().context("moe_intermediate_size")?,
+        num_experts_per_tok: tc["num_experts_per_tok"].as_i64().context("num_experts_per_tok")?,
         num_experts,
         mlp_only_layers,
     };
@@ -409,7 +372,7 @@ fn build_moe_text_model(ws: &WeightMap, cfg: &MoeTextConfig) -> Result<MoeTextMo
         } else {
             LayerMlp::Dense(Mlp {
                 gate_proj: linear(ws, &format!("{l}.mlp.gate_proj"), false)?,
-                up_proj:   linear(ws, &format!("{l}.mlp.up_proj"),   false)?,
+                up_proj: linear(ws, &format!("{l}.mlp.up_proj"), false)?,
                 down_proj: linear(ws, &format!("{l}.mlp.down_proj"), false)?,
             })
         };
@@ -428,11 +391,7 @@ fn build_moe_text_model(ws: &WeightMap, cfg: &MoeTextConfig) -> Result<MoeTextMo
             },
             mlp,
             input_norm: rms_norm(ws, &format!("{l}.input_layernorm"), cfg.rms_norm_eps)?,
-            post_attn_norm: rms_norm(
-                ws,
-                &format!("{l}.post_attention_layernorm"),
-                cfg.rms_norm_eps,
-            )?,
+            post_attn_norm: rms_norm(ws, &format!("{l}.post_attention_layernorm"), cfg.rms_norm_eps)?,
         });
     }
 
@@ -478,12 +437,7 @@ fn parse_vision_config(vc: &serde_json::Value, text_hidden_size: i64) -> Result<
 /// Text tokens receive T = H = W = sequential offset.  Image token runs are
 /// assigned 3D grid coordinates using their (T, H, W) patch grid divided by
 /// `spatial_merge_size`; the next text position advances by max(llm_h, llm_w).
-fn build_mrope_position_ids(
-    input_ids: &Tensor,
-    image_token_id: i64,
-    grid_thw: &[(i64, i64, i64)],
-    spatial_merge_size: i64,
-) -> Tensor {
+pub(crate) fn build_mrope_position_ids(input_ids: &Tensor, image_token_id: i64, grid_thw: &[(i64, i64, i64)], spatial_merge_size: i64) -> Tensor {
     let (batch, seq) = input_ids.size2().unwrap();
     let device = input_ids.device();
     let ms = spatial_merge_size;
@@ -529,9 +483,7 @@ fn build_mrope_position_ids(
         }
     }
 
-    Tensor::from_slice(&buf)
-        .reshape([3, batch, seq])
-        .to_device(device)
+    Tensor::from_slice(&buf).reshape([3, batch, seq]).to_device(device)
 }
 
 // ---------------------------------------------------------------------------
@@ -558,26 +510,25 @@ trait TextForward {
 }
 
 impl TextForward for TextModel {
-    fn fwd(&self, input_ids: &Tensor) -> Tensor { self.forward(input_ids) }
+    fn fwd(&self, input_ids: &Tensor) -> Tensor {
+        self.forward(input_ids)
+    }
     fn fwd_mm(&self, input_ids: &Tensor, pos: &Tensor, img: &Tensor, ds: &[Tensor], tok: i64) -> Tensor {
         self.forward_multimodal(input_ids, pos, img, ds, tok)
     }
 }
 
 impl TextForward for MoeTextModel {
-    fn fwd(&self, input_ids: &Tensor) -> Tensor { self.forward(input_ids) }
+    fn fwd(&self, input_ids: &Tensor) -> Tensor {
+        self.forward(input_ids)
+    }
     fn fwd_mm(&self, input_ids: &Tensor, pos: &Tensor, img: &Tensor, ds: &[Tensor], tok: i64) -> Tensor {
         self.forward_multimodal(input_ids, pos, img, ds, tok)
     }
 }
 
 fn embed_inner(
-    model: &dyn TextForward,
-    vision: Option<&Arc<VisionModel>>,
-    pad_token_id: i64,
-    image_token_id: i64,
-    spatial_merge_size: i64,
-    info: &dyn TokenizedData,
+    model: &dyn TextForward, vision: Option<&Arc<VisionModel>>, pad_token_id: i64, image_token_id: i64, spatial_merge_size: i64, info: &dyn TokenizedData,
 ) -> Result<Tensor> {
     let data = (info as &dyn std::any::Any)
         .downcast_ref::<Qwen3VLTokenizedData>()
@@ -596,7 +547,7 @@ fn embed_inner(
     };
     let mask = input_ids.ne(pad_token_id).to_kind(Kind::Int64);
     let emb = pool_last(&hidden, &mask);
-    let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1e-12);
+    let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1.0e-12);
     Ok(emb / norm)
 }
 
@@ -625,11 +576,14 @@ struct RankingModelImpl {
 
 impl RankingModel for RankingModelImpl {
     fn rank(&self, docs: &[Tensor]) -> Result<Tensor> {
-        let scores: Vec<Tensor> = docs.iter().map(|doc| {
-            let hidden = tch::no_grad(|| self.model.forward(doc));
-            let last = hidden.select(1, -1);
-            self.score_linear.forward(&last).sigmoid().squeeze_dim(-1)
-        }).collect();
+        let scores: Vec<Tensor> = docs
+            .iter()
+            .map(|doc| {
+                let hidden = tch::no_grad(|| self.model.forward(doc));
+                let last = hidden.select(1, -1);
+                self.score_linear.forward(&last).sigmoid().squeeze_dim(-1)
+            })
+            .collect();
         Ok(Tensor::cat(&scores, 0))
     }
 }
@@ -649,6 +603,97 @@ impl EmbeddingModel for MoeEmbeddingModelImpl {
 }
 
 // ---------------------------------------------------------------------------
+// Image preprocessing
+// ---------------------------------------------------------------------------
+
+/// Resizes, normalizes, and patches a still image for the Qwen3-VL vision encoder.
+/// Returns pixel_values `[T*H*W, C*tp*P*P]` and the grid `(T, H, W)` in patch units.
+pub(crate) fn preprocess_image(
+    img: &image::DynamicImage, patch_size: i64, spatial_merge_size: i64, temporal_patch_size: i64, in_channels: i64,
+) -> Result<(Tensor, (i64, i64, i64))> {
+    let tile = patch_size * spatial_merge_size;
+    let (ow, oh) = (img.width() as i64, img.height() as i64);
+    let new_h = ((oh as f64 / tile as f64).round() as i64 * tile).max(tile);
+    let new_w = ((ow as f64 / tile as f64).round() as i64 * tile).max(tile);
+    let rgb = img.resize_exact(new_w as u32, new_h as u32, image::imageops::FilterType::CatmullRom).into_rgb8();
+    let raw = rgb.as_raw();
+    let (h, w, c) = (new_h as usize, new_w as usize, in_channels as usize);
+    let mut chw = vec![0.0f32; c * h * w];
+    for y in 0..h {
+        for x in 0..w {
+            for ci in 0..c {
+                chw[ci * h * w + y * w + x] = (raw[(y * w + x) * c + ci] as f32 / 255.0 - 0.5) / 0.5;
+            }
+        }
+    }
+    let (gh, gw, tp, p, ms) = (new_h / patch_size, new_w / patch_size, temporal_patch_size, patch_size, spatial_merge_size);
+    let frame = Tensor::from_slice(&chw).reshape([in_channels, new_h, new_w]).to_kind(Kind::BFloat16);
+    let frames = frame.unsqueeze(0).expand([tp, -1, -1, -1], false).contiguous().unsqueeze(0);
+    let r = frames
+        .reshape([1, 1, tp, in_channels, gh / ms, ms, p, gw / ms, ms, p])
+        .permute([0, 1, 4, 7, 5, 8, 3, 2, 6, 9]);
+    Ok((r.reshape([gh * gw, in_channels * tp * p * p]), (1, gh, gw)))
+}
+
+// ---------------------------------------------------------------------------
+// Image tokenizer
+// ---------------------------------------------------------------------------
+
+struct Qwen3VLImageTokenizer {
+    patch_size: i64,
+    spatial_merge_size: i64,
+    temporal_patch_size: i64,
+    in_channels: i64,
+    image_token_id: i64,
+}
+
+impl ImageTokenizer for Qwen3VLImageTokenizer {
+    fn encode(&self, img: &image::DynamicImage) -> anyhow::Result<Box<dyn TokenizedData>> {
+        let (pixel_values, (t, h, w)) = preprocess_image(img, self.patch_size, self.spatial_merge_size, self.temporal_patch_size, self.in_channels)?;
+        let num_tokens = t * (h / self.spatial_merge_size) * (w / self.spatial_merge_size);
+        let input_ids = Tensor::full([1, num_tokens], self.image_token_id, (Kind::Int64, tch::Device::Cpu));
+        Ok(Box::new(Qwen3VLTokenizedData {
+            input_ids,
+            pixel_values: Some(pixel_values),
+            grid_thw: Some(vec![(t, h, w)]),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text tokenizer
+// ---------------------------------------------------------------------------
+
+struct Qwen3VLTextTokenizer {
+    inner: tokenizers::Tokenizer,
+}
+
+impl TextTokenizer for Qwen3VLTextTokenizer {
+    fn encode(&self, text: &str) -> anyhow::Result<Box<dyn TokenizedData>> {
+        let enc = self.inner.encode(text, false).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ids = enc.get_ids();
+        let seq = ids.len() as i64;
+        anyhow::ensure!(ids.iter().all(|&x| x < i32::MIN as u32), "token id exceeds i32 domain");
+        // SAFETY: all ids have high bit clear so u32 and i32 bit patterns are identical.
+        let input_ids = unsafe {
+            let i32s = std::slice::from_raw_parts(ids.as_ptr() as *const i32, ids.len());
+            Tensor::from_slice(i32s).to_kind(Kind::Int64).reshape([1, seq])
+        };
+        Ok(Box::new(Qwen3VLTokenizedData {
+            input_ids,
+            pixel_values: None,
+            grid_thw: None,
+        }))
+    }
+    fn decode(&self, tokens: Tensor) -> anyhow::Result<String> {
+        let ids: Vec<i64> = tokens.flatten(0, -1).try_into()?;
+        self.inner
+            .decode(&ids.iter().map(|&x| x as u32).collect::<Vec<_>>(), true)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ModelLoader implementations
 // ---------------------------------------------------------------------------
 
@@ -662,19 +707,25 @@ struct Qwen3VLDenseModelLoader {
 }
 
 impl ModelLoader for Qwen3VLDenseModelLoader {
-    fn identifier(&self) -> Option<ModelIds> { Some(self.id) }
+    fn identifier(&self) -> Option<ModelIds> {
+        Some(self.id)
+    }
     fn initialize(&self, device: tch::Device) -> Result<Box<dyn LocalModelBuilder>> {
         let ws = WeightMap::from_paths(self.shard_paths.clone(), device)?;
         let pad = self.tokenizer.token_to_id("<|endoftext|>").context("pad token missing")? as i64;
-        let sw = matches!(self.id, ModelIds::Qwen3VLReranker)
-            .then(|| build_score_weight(&ws, &self.tokenizer)).transpose()?;
+        let sw = matches!(self.id, ModelIds::Qwen3VLReranker).then(|| build_score_weight(&ws, &self.tokenizer)).transpose()?;
         Ok(Box::new(Qwen3VLBuilder {
             id: self.id,
             model: Arc::new(build_dense_text_model(&ws, &self.text_cfg)?),
             vision: Some(Arc::new(build_vision_model(&ws, &self.vision_cfg)?)),
-            score_weight: sw, pad_token_id: pad,
+            score_weight: sw,
+            pad_token_id: pad,
             image_token_id: self.image_token_id,
             spatial_merge_size: self.vision_cfg.spatial_merge_size,
+            patch_size: self.vision_cfg.patch_size,
+            temporal_patch_size: self.vision_cfg.temporal_patch_size,
+            in_channels: self.vision_cfg.in_channels,
+            tokenizer: self.tokenizer.clone(),
         }))
     }
 }
@@ -688,7 +739,9 @@ struct Qwen3VLMoeModelLoader {
 }
 
 impl ModelLoader for Qwen3VLMoeModelLoader {
-    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLMoe) }
+    fn identifier(&self) -> Option<ModelIds> {
+        Some(ModelIds::Qwen3VLMoe)
+    }
     fn initialize(&self, device: tch::Device) -> Result<Box<dyn LocalModelBuilder>> {
         let ws = WeightMap::from_paths(self.shard_paths.clone(), device)?;
         let pad = self.tokenizer.token_to_id("<|endoftext|>").context("pad token missing")? as i64;
@@ -698,6 +751,10 @@ impl ModelLoader for Qwen3VLMoeModelLoader {
             pad_token_id: pad,
             image_token_id: self.image_token_id,
             spatial_merge_size: self.vision_cfg.spatial_merge_size,
+            patch_size: self.vision_cfg.patch_size,
+            temporal_patch_size: self.vision_cfg.temporal_patch_size,
+            in_channels: self.vision_cfg.in_channels,
+            tokenizer: self.tokenizer.clone(),
         }))
     }
 }
@@ -715,6 +772,10 @@ pub struct Qwen3VLBuilder {
     pad_token_id: i64,
     image_token_id: i64,
     spatial_merge_size: i64,
+    patch_size: i64,
+    temporal_patch_size: i64,
+    in_channels: i64,
+    tokenizer: tokenizers::Tokenizer,
 }
 
 impl LocalModelBuilder for Qwen3VLBuilder {
@@ -723,11 +784,17 @@ impl LocalModelBuilder for Qwen3VLBuilder {
     }
 
     fn text_tokenizer(&self) -> Option<Box<dyn TextTokenizer>> {
-        None
+        Some(Box::new(Qwen3VLTextTokenizer { inner: self.tokenizer.clone() }))
     }
 
     fn image_tokenizer(&self) -> Option<Box<dyn ImageTokenizer>> {
-        None
+        Some(Box::new(Qwen3VLImageTokenizer {
+            patch_size: self.patch_size,
+            spatial_merge_size: self.spatial_merge_size,
+            temporal_patch_size: self.temporal_patch_size,
+            in_channels: self.in_channels,
+            image_token_id: self.image_token_id,
+        }))
     }
 
     fn is_embedding_model(&self) -> bool {
@@ -774,6 +841,10 @@ pub struct Qwen3VLMoeBuilder {
     pad_token_id: i64,
     image_token_id: i64,
     spatial_merge_size: i64,
+    patch_size: i64,
+    temporal_patch_size: i64,
+    in_channels: i64,
+    tokenizer: tokenizers::Tokenizer,
 }
 
 impl LocalModelBuilder for Qwen3VLMoeBuilder {
@@ -782,11 +853,17 @@ impl LocalModelBuilder for Qwen3VLMoeBuilder {
     }
 
     fn text_tokenizer(&self) -> Option<Box<dyn TextTokenizer>> {
-        None
+        Some(Box::new(Qwen3VLTextTokenizer { inner: self.tokenizer.clone() }))
     }
 
     fn image_tokenizer(&self) -> Option<Box<dyn ImageTokenizer>> {
-        None
+        Some(Box::new(Qwen3VLImageTokenizer {
+            patch_size: self.patch_size,
+            spatial_merge_size: self.spatial_merge_size,
+            temporal_patch_size: self.temporal_patch_size,
+            in_channels: self.in_channels,
+            image_token_id: self.image_token_id,
+        }))
     }
 
     fn is_embedding_model(&self) -> bool {
@@ -816,29 +893,33 @@ impl LocalModelBuilder for Qwen3VLMoeBuilder {
 // Load logic
 // ---------------------------------------------------------------------------
 
-async fn load_dense_builder(
-    repo: Box<dyn ModelRepo>,
-    id: ModelIds,
-) -> Result<Box<dyn ModelLoader>> {
+async fn load_dense_builder(repo: Box<dyn ModelRepo>, id: ModelIds) -> Result<Box<dyn ModelLoader>> {
     let (text_cfg, vision_cfg, image_token_id) = parse_dense_config(repo.as_ref()).await?;
-    let tokenizer_path = repo.get_local_path("tokenizer.json").await?
-        .context("tokenizer.json not found")?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?;
+    let tokenizer_path = repo.get_local_path("tokenizer.json").await?.context("tokenizer.json not found")?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?;
     let shard_paths = resolve_shard_paths(repo.as_ref()).await?;
-    Ok(Box::new(Qwen3VLDenseModelLoader { id, text_cfg, vision_cfg, image_token_id, tokenizer, shard_paths }))
+    Ok(Box::new(Qwen3VLDenseModelLoader {
+        id,
+        text_cfg,
+        vision_cfg,
+        image_token_id,
+        tokenizer,
+        shard_paths,
+    }))
 }
 
-async fn load_moe_builder(
-    repo: Box<dyn ModelRepo>,
-) -> Result<Box<dyn ModelLoader>> {
+async fn load_moe_builder(repo: Box<dyn ModelRepo>) -> Result<Box<dyn ModelLoader>> {
     let (text_cfg, vision_cfg, image_token_id) = parse_moe_config(repo.as_ref()).await?;
-    let tokenizer_path = repo.get_local_path("tokenizer.json").await?
-        .context("tokenizer.json not found")?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?;
+    let tokenizer_path = repo.get_local_path("tokenizer.json").await?.context("tokenizer.json not found")?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("tokenizer load error: {e}"))?;
     let shard_paths = resolve_shard_paths(repo.as_ref()).await?;
-    Ok(Box::new(Qwen3VLMoeModelLoader { text_cfg, vision_cfg, image_token_id, tokenizer, shard_paths }))
+    Ok(Box::new(Qwen3VLMoeModelLoader {
+        text_cfg,
+        vision_cfg,
+        image_token_id,
+        tokenizer,
+        shard_paths,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -849,8 +930,10 @@ async fn load_moe_builder(
 pub struct Qwen3VLEmbeddingFactory;
 
 impl ModelFactory for Qwen3VLEmbeddingFactory {
-    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLEmbedding) }
-    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=Result<Box<dyn ModelLoader>>> + 'a>> {
+    fn identifier(&self) -> Option<ModelIds> {
+        Some(ModelIds::Qwen3VLEmbedding)
+    }
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output = Result<Box<dyn ModelLoader>>> + 'a>> {
         Box::pin(load_dense_builder(repo, self.identifier().unwrap()))
     }
 }
@@ -859,8 +942,10 @@ impl ModelFactory for Qwen3VLEmbeddingFactory {
 pub struct Qwen3VLRerankerFactory;
 
 impl ModelFactory for Qwen3VLRerankerFactory {
-    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLReranker) }
-    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=Result<Box<dyn ModelLoader>>> + 'a>> {
+    fn identifier(&self) -> Option<ModelIds> {
+        Some(ModelIds::Qwen3VLReranker)
+    }
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output = Result<Box<dyn ModelLoader>>> + 'a>> {
         Box::pin(load_dense_builder(repo, self.identifier().unwrap()))
     }
 }
@@ -869,8 +954,10 @@ impl ModelFactory for Qwen3VLRerankerFactory {
 pub struct Qwen3VLMoeFactory;
 
 impl ModelFactory for Qwen3VLMoeFactory {
-    fn identifier(&self) -> Option<ModelIds> { Some(ModelIds::Qwen3VLMoe) }
-    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output=Result<Box<dyn ModelLoader>>> + 'a>> {
+    fn identifier(&self) -> Option<ModelIds> {
+        Some(ModelIds::Qwen3VLMoe)
+    }
+    fn load<'a>(&'a self, repo: Box<dyn ModelRepo>) -> Pin<Box<dyn Future<Output = Result<Box<dyn ModelLoader>>> + 'a>> {
         Box::pin(load_moe_builder(repo))
     }
 }
@@ -881,4 +968,13 @@ pub(crate) async fn load_text_model_from_dir(p: &std::path::Path) -> Result<dens
     let repo = init_repo(p).await?;
     let (cfg, _, _) = parse_dense_config(repo.as_ref()).await?;
     build_dense_text_model(&WeightMap::load(repo.as_ref(), tch::Device::Cpu).await?, &cfg)
+}
+
+#[cfg(test)]
+/// Loads the dense text + vision models for step-by-step debug tests.
+pub(crate) async fn load_dense_for_debug(p: &std::path::Path, device: tch::Device) -> Result<(dense::TextModel, VisionModel, vision::VisionConfig, i64)> {
+    let repo = init_repo(p).await?;
+    let (tcfg, vcfg, image_token_id) = parse_dense_config(repo.as_ref()).await?;
+    let ws = WeightMap::load(repo.as_ref(), device).await?;
+    Ok((build_dense_text_model(&ws, &tcfg)?, build_vision_model(&ws, &vcfg)?, vcfg, image_token_id))
 }

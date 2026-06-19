@@ -1,8 +1,16 @@
-use std::{collections::HashSet, future::Future, path::{Path, PathBuf}, pin::Pin};
+use std::{
+    collections::HashSet,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+};
 
 use hf_hub::api::tokio::ApiRepo;
 
-use crate::transformers::{model_ids::{infer_remote_repo, ModelIds}, traits::ModelRepo};
+use crate::transformers::{
+    model_ids::{ModelIds, infer_remote_repo},
+    traits::ModelRepo,
+};
 
 /// A `ModelRepo` backed by the HuggingFace Hub async API.
 pub struct RemoteRepo {
@@ -26,7 +34,7 @@ impl ModelRepo for RemoteRepo {
         self.id
     }
 
-    fn get_local_path<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output=anyhow::Result<Option<PathBuf>>> + 'a>> {
+    fn get_local_path<'a>(&'a self, name: &'a str) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<PathBuf>>> + 'a>> {
         Box::pin(async move {
             if !self.contents.contains(Path::new(name)) {
                 return Ok(None);

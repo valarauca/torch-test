@@ -54,15 +54,8 @@ impl VisionPatchEmbed {
         let x = hidden_states
             .to_kind(dtype)
             .reshape([-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size]);
-        x.conv3d(
-            &self.proj.weight,
-            Some(&self.proj.bias),
-            self.proj.kernel.as_ref(),
-            &[0i64, 0, 0],
-            &[1i64, 1, 1],
-            1,
-        )
-        .reshape([-1, self.embed_dim])
+        x.conv3d(&self.proj.weight, Some(&self.proj.bias), self.proj.kernel.as_ref(), &[0i64, 0, 0], &[1i64, 1, 1], 1)
+            .reshape([-1, self.embed_dim])
     }
 }
 
@@ -73,15 +66,11 @@ pub struct VisionRotaryEmbedding {
 }
 
 impl VisionRotaryEmbedding {
-    /// Builds inv_freq = 1 / 10000^(2i/dim) for i in [0, dim/2).
+    /// Builds inv_freq = 1 / 10000^(2i/dim) for i in [0, dim/2), matching
+    /// PyTorch's `1.0 / (theta ** (arange(0, dim, 2) / dim))` exactly.
     pub fn new(dim: i64, device: tch::Device) -> Self {
-        let inv_freq = Tensor::arange(dim / 2, (Kind::Float, device))
-            .f_mul_scalar(2.0 / dim as f64)
-            .unwrap()
-            .f_mul_scalar(10000.0_f64.ln())
-            .unwrap()
-            .exp()
-            .reciprocal();
+        let exponents = Tensor::arange_start_step(0, dim, 2, (Kind::Float, device)).f_div_scalar(dim as f64).unwrap();
+        let inv_freq = Tensor::pow_scalar(10000.0, &exponents).reciprocal();
         Self { inv_freq }
     }
 
@@ -110,12 +99,7 @@ fn rotate_half(x: &Tensor) -> Tensor {
     Tensor::cat(&[&x.narrow(-1, half, half).neg(), &x.narrow(-1, 0, half)], -1)
 }
 
-fn apply_rotary_pos_emb_vision(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> (Tensor, Tensor) {
+fn apply_rotary_pos_emb_vision(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> (Tensor, Tensor) {
     let orig_q = q.kind();
     let orig_k = k.kind();
     let qf = q.to_kind(Kind::Float);
@@ -138,19 +122,9 @@ pub struct VisionAttention {
 
 impl VisionAttention {
     /// cu_seqlens: cumulative sequence offsets [0, len_0, len_0+len_1, ...].
-    pub fn forward(
-        &self,
-        hidden: &Tensor,
-        cu_seqlens: &[i64],
-        cos: &Tensor,
-        sin: &Tensor,
-    ) -> Tensor {
+    pub fn forward(&self, hidden: &Tensor, cu_seqlens: &[i64], cos: &Tensor, sin: &Tensor) -> Tensor {
         let seq_len = hidden.size()[0];
-        let qkv = self
-            .qkv
-            .forward(hidden)
-            .reshape([seq_len, 3, self.num_heads, self.head_dim])
-            .permute([1i64, 0, 2, 3]);
+        let qkv = self.qkv.forward(hidden).reshape([seq_len, 3, self.num_heads, self.head_dim]).permute([1i64, 0, 2, 3]);
         let q = qkv.select(0, 0);
         let k = qkv.select(0, 1);
         let v = qkv.select(0, 2);
@@ -192,13 +166,7 @@ pub struct VisionBlock {
 }
 
 impl VisionBlock {
-    pub fn forward(
-        &self,
-        hidden: &Tensor,
-        cu_seqlens: &[i64],
-        cos: &Tensor,
-        sin: &Tensor,
-    ) -> Tensor {
+    pub fn forward(&self, hidden: &Tensor, cu_seqlens: &[i64], cos: &Tensor, sin: &Tensor) -> Tensor {
         let h = hidden + self.attn.forward(&self.norm1.forward(hidden), cu_seqlens, cos, sin);
         &h + self.mlp.forward(&self.norm2.forward(&h))
     }
@@ -227,6 +195,8 @@ impl PatchMerger {
 
 /// Outputs of the vision encoder.
 pub struct VisionOutput {
+    /// Pre-merger hidden states: [total_patches, hidden_size].
+    pub pre_merger: Tensor,
     /// Merged image tokens: [total_merged_tokens, out_hidden_size].
     pub image_features: Tensor,
     /// One tensor per deepstack layer: [total_merged_tokens, out_hidden_size].
@@ -258,20 +228,14 @@ impl VisionModel {
 
         let cu_seqlens = cu_seqlens_from_grid_thw(grid_thw);
         let position_ids = vision_position_ids(grid_thw, self.spatial_merge_size, device);
-        let (bilinear_idx, bilinear_wt) = bilinear_pos_embed_indices_and_weights(
-            grid_thw,
-            self.num_grid_per_side,
-            self.spatial_merge_size,
-            device,
-        );
+        let (bilinear_idx, bilinear_wt) = bilinear_pos_embed_indices_and_weights(grid_thw, self.num_grid_per_side, self.spatial_merge_size, device);
 
         let mut hidden = self.patch_embed.forward(pixel_values);
 
         let pos_emb_flat = self.pos_embed.index_select(0, &bilinear_idx.reshape([-1]));
         let total_patches: i64 = grid_thw.iter().map(|(t, h, w)| t * h * w).sum();
         let pos_emb_4 = pos_emb_flat.reshape([4, total_patches, self.hidden_size]);
-        let pos_embeds = (pos_emb_4 * bilinear_wt.unsqueeze(-1))
-            .sum_dim_intlist([0i64].as_ref(), false, Kind::Float);
+        let pos_embeds = (pos_emb_4 * bilinear_wt.unsqueeze(-1)).sum_dim_intlist([0i64].as_ref(), false, Kind::Float);
         let hidden_kind = hidden.kind();
         hidden = hidden + pos_embeds.to_kind(hidden_kind);
 
@@ -289,8 +253,16 @@ impl VisionModel {
 
         VisionOutput {
             image_features: self.merger.forward(&hidden),
+            pre_merger: hidden,
             deepstack_features,
         }
+    }
+    /// Returns the interpolated positional embeddings for `grid_thw`, shape `[total_patches, hidden_size]`.
+    pub(crate) fn bilinear_pos_embeds(&self, grid_thw: &[(i64, i64, i64)], device: tch::Device) -> Tensor {
+        let (idx, wt) = bilinear_pos_embed_indices_and_weights(grid_thw, self.num_grid_per_side, self.spatial_merge_size, device);
+        let total: i64 = grid_thw.iter().map(|(t, h, w)| t * h * w).sum();
+        let emb = self.pos_embed.index_select(0, &idx.reshape([-1])).reshape([4, total, self.hidden_size]);
+        (emb * wt.unsqueeze(-1)).sum_dim_intlist([0i64].as_ref(), false, tch::Kind::Float)
     }
 }
 
@@ -319,11 +291,7 @@ pub fn cu_seqlens_from_grid_thw(grid_thw: &[(i64, i64, i64)]) -> Vec<i64> {
 /// before moving to the next block.  This matches the order produced by the
 /// image preprocessor and expected by `PatchMerger`.
 /// Returns [total_patches, 2] Int64 tensor on `device`.
-pub fn vision_position_ids(
-    grid_thw: &[(i64, i64, i64)],
-    spatial_merge_size: i64,
-    device: tch::Device,
-) -> Tensor {
+pub fn vision_position_ids(grid_thw: &[(i64, i64, i64)], spatial_merge_size: i64, device: tch::Device) -> Tensor {
     let total: i64 = grid_thw.iter().map(|(t, h, w)| t * h * w).sum();
     let ms = spatial_merge_size;
     let mut buf = Vec::with_capacity((total * 2) as usize);
@@ -350,19 +318,17 @@ pub fn vision_position_ids(
 /// the resulting embedding slice aligns with the patch tensor.
 ///
 /// Returns `(indices, weights)` each shaped [4, total_patches].
-pub fn bilinear_pos_embed_indices_and_weights(
-    grid_thw: &[(i64, i64, i64)],
-    num_grid_per_side: i64,
-    spatial_merge_size: i64,
-    device: tch::Device,
-) -> (Tensor, Tensor) {
+pub fn bilinear_pos_embed_indices_and_weights(grid_thw: &[(i64, i64, i64)], num_grid_per_side: i64, spatial_merge_size: i64, device: tch::Device) -> (Tensor, Tensor) {
     let n = num_grid_per_side;
     let ms = spatial_merge_size;
     let total: i64 = grid_thw.iter().map(|(t, h, w)| t * h * w).sum();
     let mut idx_buf = Vec::<i64>::with_capacity((total * 4) as usize);
     let mut wt_buf = Vec::<f32>::with_capacity((total * 4) as usize);
 
+    let cpu = tch::Device::Cpu;
     for &(t, h, w) in grid_thw {
+        let hg: Vec<f32> = Vec::try_from(Tensor::linspace(0, n - 1, h, (Kind::Float, cpu))).unwrap();
+        let wg: Vec<f32> = Vec::try_from(Tensor::linspace(0, n - 1, w, (Kind::Float, cpu))).unwrap();
         for _ in 0..t {
             for br in 0..(h / ms) {
                 for bc in 0..(w / ms) {
@@ -371,23 +337,15 @@ pub fn bilinear_pos_embed_indices_and_weights(
                             let hi = br * ms + ir;
                             let wi = bc * ms + ic;
 
-                            let h_f = if h <= 1 {
-                                (n - 1) as f64 / 2.0
-                            } else {
-                                hi as f64 * (n - 1) as f64 / (h - 1) as f64
-                            };
-                            let h0 = (h_f as i64).min(n - 2);
-                            let h1 = h0 + 1;
-                            let dh = (h_f - h0 as f64) as f32;
+                            let h_f = hg[hi as usize];
+                            let h0 = h_f as i64;
+                            let h1 = (h0 + 1).min(n - 1);
+                            let dh = h_f - h0 as f32;
 
-                            let w_f = if w <= 1 {
-                                (n - 1) as f64 / 2.0
-                            } else {
-                                wi as f64 * (n - 1) as f64 / (w - 1) as f64
-                            };
-                            let w0 = (w_f as i64).min(n - 2);
-                            let w1 = w0 + 1;
-                            let dw = (w_f - w0 as f64) as f32;
+                            let w_f = wg[wi as usize];
+                            let w0 = w_f as i64;
+                            let w1 = (w0 + 1).min(n - 1);
+                            let dw = w_f - w0 as f32;
 
                             idx_buf.push(h0 * n + w0);
                             idx_buf.push(h0 * n + w1);
@@ -405,11 +363,7 @@ pub fn bilinear_pos_embed_indices_and_weights(
         }
     }
 
-    let idx = Tensor::from_slice(&idx_buf)
-        .reshape([total, 4])
-        .transpose(0, 1)
-        .contiguous()
-        .to_device(device);
+    let idx = Tensor::from_slice(&idx_buf).reshape([total, 4]).transpose(0, 1).contiguous().to_device(device);
     let wt = Tensor::from_slice(&wt_buf)
         .reshape([total, 4])
         .transpose(0, 1)

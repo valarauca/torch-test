@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use hf_hub::{api::tokio::ApiRepo, CacheRepo};
+use hf_hub::{CacheRepo, api::tokio::ApiRepo};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 #[repr(u64)]
@@ -14,7 +14,9 @@ pub enum ModelIds {
 /// Infers a `ModelIds` from a local directory by reading its `config.json`.
 pub(crate) fn infer_local_path(root: &Path) -> anyhow::Result<Option<ModelIds>> {
     let path = root.join("config.json");
-    if !path.try_exists().unwrap_or(false) { return Ok(None); }
+    if !path.try_exists().unwrap_or(false) {
+        return Ok(None);
+    }
     let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     Ok(classify_config(&raw))
 }
