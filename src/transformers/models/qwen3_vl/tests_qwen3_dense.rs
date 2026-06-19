@@ -9,9 +9,9 @@ use pyo3::{
 use tch::{Kind, Tensor, no_grad};
 use tokenizers::Tokenizer;
 
-use super::{Qwen3VLEmbeddingFactory, Qwen3VLTokenizedData};
+use super::{Qwen3VLEmbeddingFactory, Qwen3VLRerankerFactory, Qwen3VLTokenizedData};
 use crate::transformers::repo::init_repo;
-use crate::transformers::traits::{EmbeddingScheme, ModelFactory};
+use crate::transformers::traits::{EmbeddingScheme, ModelFactory, TokenizedData};
 
 const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/transformers/models/qwen3_vl/py_tests/heck overflow.jpeg");
 
@@ -160,4 +160,57 @@ async fn qwen3_dense_multimodal_embed_matches_python() {
         .map(|(i, _)| i)
         .collect();
     assert!(mismatches.is_empty(), "{} mismatches; first at [{}]: rust={:.6} py={:.6}", mismatches.len(), mismatches[0], rust_vec[mismatches[0]], py_vec[mismatches[0]]);
+}
+
+#[tokio::test]
+async fn qwen3_reranker_score_matches_python() {
+    let path = match std::env::var("QWEN3_RERANKER_PATH") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            let api_repo = Api::new().expect("hf hub init failed").model("Qwen/Qwen3-VL-Reranker-2B".to_string());
+            let root = api_repo.get("config.json").await.expect("config.json download failed").parent().unwrap().to_path_buf();
+            api_repo.get("tokenizer.json").await.expect("tokenizer.json download failed");
+            api_repo.get("model.safetensors").await.expect("model.safetensors download failed");
+            root
+        }
+    };
+    let dev = tch::Device::cuda_if_available();
+    assert!(dev.is_cuda(), "this reranker test requires a CUDA device");
+
+    let (input_ids, pixel_values, grid_thw, py_score): (Vec<i64>, Vec<f32>, Vec<i64>, f64) = Python::with_gil(|py| -> PyResult<_> {
+        let locals = PyDict::new(py);
+        locals.set_item("venv_path", concat!(env!("CARGO_MANIFEST_DIR"), "/.venv"))?;
+        locals.set_item("model_path", path.to_str().unwrap())?;
+        locals.set_item("image_path", TEST_IMAGE)?;
+        locals.set_item("query_text", "What does this image show?")?;
+        py.run(c_str!(include_str!("py_tests/tests_qwen3_reranker_helper.py")), None, Some(&locals))?;
+        Ok((
+            locals.get_item("input_ids")?.unwrap().extract()?,
+            locals.get_item("pixel_values_flat")?.unwrap().extract()?,
+            locals.get_item("grid_thw")?.unwrap().extract()?,
+            locals.get_item("py_score")?.unwrap().extract()?,
+        ))
+    })
+    .expect("Python reranker inference failed");
+
+    let (gt, gh, gw) = (grid_thw[0], grid_thw[1], grid_thw[2]);
+    let data = Qwen3VLTokenizedData {
+        input_ids: Tensor::from_slice(&input_ids).reshape([1, input_ids.len() as i64]).to_device(dev),
+        pixel_values: Some(Tensor::from_slice(&pixel_values).reshape([gt * gh * gw, -1]).to_device(dev)),
+        grid_thw: Some(vec![(gt, gh, gw)]),
+    };
+
+    let repo = init_repo(path.as_path()).await.expect("init_repo failed");
+    let factory: &dyn ModelFactory = &Qwen3VLRerankerFactory;
+    let loader = factory.load(repo).await.expect("factory load failed");
+    let builder = loader.initialize(dev).expect("initialize failed");
+    let ranker = builder.get_ranking_model(EmbeddingScheme::NoInput).expect("not a ranking model").expect("get ranking model failed");
+    let doc: &dyn TokenizedData = &data;
+    let scores = ranker.rank(&[doc]).expect("rank failed");
+    let rust_score = scores.to_device(tch::Device::Cpu).double_value(&[0]);
+
+    assert!(
+        (rust_score - py_score).abs() < 1.0e-7,
+        "reranker score mismatch: rust={rust_score:.8} py={py_score:.8}"
+    );
 }

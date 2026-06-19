@@ -99,5 +99,7 @@ pub trait EmbeddingModel: 'static {
 
 /// Model for Ranking inputs
 pub trait RankingModel: 'static {
-    fn rank(&self, docs: &[tch::Tensor]) -> anyhow::Result<tch::Tensor>;
+    /// Scores each tokenized query-document pair.  Each `TokenizedData` may carry
+    /// optional vision tensors, so ranking covers text-only and multimodal inputs.
+    fn rank(&self, docs: &[&dyn TokenizedData]) -> anyhow::Result<tch::Tensor>;
 }

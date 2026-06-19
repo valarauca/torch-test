@@ -290,7 +290,7 @@ fn build_dense_text_model(ws: &WeightMap, cfg: &TextConfig) -> Result<TextModel>
 fn build_score_weight(ws: &WeightMap, tokenizer: &tokenizers::Tokenizer) -> Result<Tensor> {
     let yes_id = tokenizer.token_to_id("yes").context("'yes' not in tokenizer vocab")? as i64;
     let no_id = tokenizer.token_to_id("no").context("'no' not in tokenizer vocab")? as i64;
-    let lm_head = ws.get("lm_head.weight")?;
+    let lm_head = ws.get("lm_head.weight").or_else(|_| ws.get("model.language_model.embed_tokens.weight"))?;
     Ok((lm_head.select(0, yes_id) - lm_head.select(0, no_id)).unsqueeze(0))
 }
 
@@ -527,25 +527,33 @@ impl TextForward for MoeTextModel {
     }
 }
 
+/// Runs the text (or multimodal) forward pass for one tokenized input, returning
+/// the final hidden states `[batch, seq, hidden]`.  Shared by embedding and ranking.
+fn forward_tokenized(
+    model: &dyn TextForward, vision: Option<&Arc<VisionModel>>, image_token_id: i64, spatial_merge_size: i64, data: &Qwen3VLTokenizedData,
+) -> Tensor {
+    let input_ids = &data.input_ids;
+    let vision_out = match (data.pixel_values.as_ref(), data.grid_thw.as_deref(), vision) {
+        (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(pv, thw))),
+        _ => None,
+    };
+    match (&vision_out, data.grid_thw.as_deref()) {
+        (Some(vo), Some(thw)) => {
+            let pos_ids = build_mrope_position_ids(input_ids, image_token_id, thw, spatial_merge_size);
+            tch::no_grad(|| model.fwd_mm(input_ids, &pos_ids, &vo.image_features, &vo.deepstack_features, image_token_id))
+        }
+        _ => tch::no_grad(|| model.fwd(input_ids)),
+    }
+}
+
 fn embed_inner(
     model: &dyn TextForward, vision: Option<&Arc<VisionModel>>, pad_token_id: i64, image_token_id: i64, spatial_merge_size: i64, info: &dyn TokenizedData,
 ) -> Result<Tensor> {
     let data = (info as &dyn std::any::Any)
         .downcast_ref::<Qwen3VLTokenizedData>()
         .ok_or_else(|| anyhow::anyhow!("TokenizedData is not Qwen3VLTokenizedData"))?;
-    let input_ids = &data.input_ids;
-    let vision_out = match (data.pixel_values.as_ref(), data.grid_thw.as_deref(), vision) {
-        (Some(pv), Some(thw), Some(vis)) => Some(tch::no_grad(|| vis.forward(pv, thw))),
-        _ => None,
-    };
-    let hidden = match (&vision_out, data.grid_thw.as_deref()) {
-        (Some(vo), Some(thw)) => {
-            let pos_ids = build_mrope_position_ids(input_ids, image_token_id, thw, spatial_merge_size);
-            tch::no_grad(|| model.fwd_mm(input_ids, &pos_ids, &vo.image_features, &vo.deepstack_features, image_token_id))
-        }
-        _ => tch::no_grad(|| model.fwd(input_ids)),
-    };
-    let mask = input_ids.ne(pad_token_id).to_kind(Kind::Int64);
+    let hidden = forward_tokenized(model, vision, image_token_id, spatial_merge_size, data);
+    let mask = data.input_ids.ne(pad_token_id).to_kind(Kind::Int64);
     let emb = pool_last(&hidden, &mask);
     let norm = emb.norm_scalaropt_dim(2.0_f64, [-1i64].as_ref(), true).clamp_min(1.0e-12);
     Ok(emb / norm)
@@ -571,19 +579,25 @@ impl EmbeddingModel for EmbeddingModelImpl {
 
 struct RankingModelImpl {
     model: Arc<TextModel>,
+    vision: Option<Arc<VisionModel>>,
     score_linear: Linear,
+    image_token_id: i64,
+    spatial_merge_size: i64,
 }
 
 impl RankingModel for RankingModelImpl {
-    fn rank(&self, docs: &[Tensor]) -> Result<Tensor> {
+    fn rank(&self, docs: &[&dyn TokenizedData]) -> Result<Tensor> {
         let scores: Vec<Tensor> = docs
             .iter()
-            .map(|doc| {
-                let hidden = tch::no_grad(|| self.model.forward(doc));
+            .map(|info| {
+                let data = (*info as &dyn std::any::Any)
+                    .downcast_ref::<Qwen3VLTokenizedData>()
+                    .ok_or_else(|| anyhow::anyhow!("TokenizedData is not Qwen3VLTokenizedData"))?;
+                let hidden = forward_tokenized(&*self.model, self.vision.as_ref(), self.image_token_id, self.spatial_merge_size, data);
                 let last = hidden.select(1, -1);
-                self.score_linear.forward(&last).sigmoid().squeeze_dim(-1)
+                Ok(self.score_linear.forward(&last).sigmoid().squeeze_dim(-1))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         Ok(Tensor::cat(&scores, 0))
     }
 }
@@ -825,7 +839,10 @@ impl LocalModelBuilder for Qwen3VLBuilder {
         let weight = self.score_weight.as_ref()?.shallow_clone();
         Some(Ok(Box::new(RankingModelImpl {
             model: Arc::clone(&self.model),
+            vision: self.vision.as_ref().map(Arc::clone),
             score_linear: Linear { weight, bias: None },
+            image_token_id: self.image_token_id,
+            spatial_merge_size: self.spatial_merge_size,
         })))
     }
 }
