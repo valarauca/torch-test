@@ -49,7 +49,7 @@ async fn qwen3_dense_forward_matches_python() {
         .iter()
         .zip(&py_vec)
         .enumerate()
-        .filter(|(_, (a, b))| (*a - *b).abs() > 1.0e-6)
+        .filter(|(_, (a, b))| (*a - *b).abs() > 1.0e-7)
         .map(|(i, _)| i)
         .collect();
     assert!(mismatches.is_empty(), "{} mismatches; first at [{}]: rust={:.6} py={:.6}", mismatches.len(), mismatches[0], rust_vec[mismatches[0]], py_vec[mismatches[0]]);
@@ -101,7 +101,7 @@ async fn qwen3_dense_embed_matches_python() {
         .iter()
         .zip(&py_vec)
         .enumerate()
-        .filter(|(_, (a, b))| (*a - *b).abs() > 1.0e-6)
+        .filter(|(_, (a, b))| (*a - *b).abs() > 1.0e-7)
         .map(|(i, _)| i)
         .collect();
     assert!(mismatches.is_empty(), "{} mismatches; first at [{}]: rust={:.6} py={:.6}", mismatches.len(), mismatches[0], rust_vec[mismatches[0]], py_vec[mismatches[0]]);
@@ -156,7 +156,7 @@ async fn qwen3_dense_multimodal_embed_matches_python() {
         .iter()
         .zip(&py_vec)
         .enumerate()
-        .filter(|(_, (a, b))| (*a - *b).abs() > 1.0e-6)
+        .filter(|(_, (a, b))| (*a - *b).abs() > 1.0e-7)
         .map(|(i, _)| i)
         .collect();
     assert!(mismatches.is_empty(), "{} mismatches; first at [{}]: rust={:.6} py={:.6}", mismatches.len(), mismatches[0], rust_vec[mismatches[0]], py_vec[mismatches[0]]);
